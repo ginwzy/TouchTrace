@@ -5,3 +5,5 @@ node_modules/
 inference/README.md
 inference/dist
 data/
+train/touch/touch_data.jsonl
+train/touch/touch_sensor_data.jsonl

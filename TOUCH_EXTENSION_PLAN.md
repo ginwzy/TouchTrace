@@ -532,15 +532,15 @@ mousecrack touch-sensor-steps <fromX> <fromY> <toX> <toY> [standard|lite] [--no-
 
 ### Phase 1：Touch 轨迹 MVP（预估 1–2 周）
 
-| 任务 | 优先级 |
-|------|--------|
-| `convert_swipemotiondb.py` | P0 |
-| `train_touch.py` + `touch_data.jsonl` | P0 |
-| 导出 `touch.onnx` | P0 |
-| `inference/touch.ts` — `touchSteps()` | P0 |
-| CLI `touch-steps` 子命令 | P1 |
-| 基础评估脚本（路径统计对比） | P1 |
-| 文档更新（README 触摸章节） | P2 |
+| 任务 | 优先级 | 状态 |
+|------|--------|------|
+| `convert_swipemotiondb.py` | P0 | 完成（33,058 条 jsonl） |
+| `train_touch.py` + `touch_data.jsonl` | P0 | |
+| 导出 `touch.onnx` | P0 | |
+| `inference/touch.ts` — `touchSteps()` | P0 | |
+| CLI `touch-steps` 子命令 | P1 | |
+| 基础评估脚本（路径统计对比） | P1 | |
+| 文档更新（README 触摸章节） | P2 | |
 
 **验收标准：**
 
