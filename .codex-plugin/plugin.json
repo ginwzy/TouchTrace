@@ -1,0 +1,9 @@
+{
+    "name": "touch-trace",
+    "description": "Synthesize human-like touch trajectories and sensor data.",
+    "version": "0.1.0",
+    "author": {
+        "name": "ginwzy"
+    },
+    "skills": "./skills/"
+}

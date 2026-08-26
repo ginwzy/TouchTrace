@@ -1,0 +1,13 @@
+{
+    "name": "touchtrace",
+    "owner": {
+        "name": "ginwzy"
+    },
+    "plugins": [
+        {
+            "name": "touch-trace",
+            "source": "./",
+            "description": "Synthesize human-like touch trajectories and sensor data."
+        }
+    ]
+}
