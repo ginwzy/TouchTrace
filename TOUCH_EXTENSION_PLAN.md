@@ -1,8 +1,8 @@
 # TouchTrace 开发计划
 
 > 触摸轨迹 + 传感器数据生成（仅输出，不执行）  
-> 状态：规划阶段，尚未实现  
-> 日期：2026-08-26  
+> 状态：Phase 0 完成；Phase 1–2 尚未实现  
+> 日期：2026-08-26（附录 C：2026-08-27）  
 > 仓库：https://github.com/ginwzy/TouchTrace
 
 ---
@@ -29,7 +29,7 @@ TouchTrace 当前基于 deep learning 的轨迹合成框架（源自 [mousecrack
 | **只输出结果** | 生成 JSON 格式的轨迹/传感器序列，不调用 robotjs，不注入真实触摸或传感器 |
 | **不自动执行** | 移除对硬件控制的依赖，推理层为纯函数 |
 | **复用现有架构** | 尽可能保留 LSTM + MDN + 自回归生成框架 |
-| **第一版数据源** | 使用 [SwipeMotionDB](https://doi.org/10.5281/zenodo.17171888) 作为训练数据 |
+| **第一版数据源** | 使用 [CSD4CA v2](https://doi.org/10.5281/zenodo.17931118)（SwipeMotionDB 的官方清洗版） |
 
 ### 1.3 非目标（第一版不做）
 
@@ -69,30 +69,36 @@ SwipeMotionDB **足够支撑第一版 MVP**：
 
 ### 3.1 基本信息
 
-| 属性 | 值 |
-|------|-----|
-| 来源 | Zenodo — [10.5281/zenodo.17171888](https://doi.org/10.5281/zenodo.17171888) |
-| 作者 | Naji, Zakaria; Bouzidi, Driss (ENSIAS, Mohammed V University) |
-| 参与者 | 50 人 |
-| 设备 | Google Pixel 6a（单一设备） |
-| Session | 每人 2 次 |
-| 场景 | seated、walking、stress-induced |
-| 体积 | 176 MB（`.rar`） |
+**训练请用 v2（CSD4CA）**。v1 与 v2 是同一条 Zenodo concept record 的两个版本，不是两套可合并的数据。详见附录 C。
+
+| 属性 | v1 SwipeMotionDB | v2 CSD4CA（推荐） |
+|------|------------------|-------------------|
+| DOI | [10.5281/zenodo.17171888](https://doi.org/10.5281/zenodo.17171888) | [10.5281/zenodo.17931118](https://doi.org/10.5281/zenodo.17931118) |
+| 作者 | Naji, Zakaria; Bouzidi, Driss (ENSIAS) | 同左 |
+| 许可 | CC-BY-4.0 | CC-BY-4.0 |
+| 参与者 | 58 人（含编号变体场景） | **50 人**（v1 的清洗子集） |
+| 设备 | Pixel 6a，1080×2142，density 2.625 | 同左 |
+| Session | 1 / 2（另有 3 条 session=3） | 仅 1 和 2，数量接近均衡 |
+| 场景标签 | `Normal*` / `Walking*` / `Stressful*`（含编号后缀） | 仅 `Normal` / `Walking` / `Stressful` |
+| 压缩包 | 176 MB `.rar` | 126.5 MB `.rar` |
+| 原始 swipe | 42,242 | **34,417**（全部是 v1 的子集） |
 
 ### 3.2 包含的数据流
 
-**Touch 事件：**
+本地路径：`data/raw/CSD4CA/`（已 gitignore）。四个 CSV：`touch_data.csv`、`acc_data.csv`、`gyro_data.csv`、`magneto_data.csv`。
 
-- 坐标 `(x, y)`
-- 时间戳
-- pressure（压力）
-- area（接触面积）
+**Touch 事件（已按 `id_swipe` 切段，无需 down/move/up 再切）：**
 
-**Motion 传感器（与 touch 同步）：**
+- 坐标 `(x, y)`，像素，屏宽 1080、屏高 2142
+- `time`：开机后毫秒（`elapsedRealtime` 量级），需在 swipe 内归零
+- `pressure`、`touch_major` / `touch_minor`、`finger_size`
 
-- Accelerometer（加速度计）
-- Gyroscope（陀螺仪）
-- Magnetometer（磁力计）
+**Motion 传感器（按同一 `id_swipe` 对齐，不是同一绝对时钟）：**
+
+- Accelerometer（含重力，`|a|` 中位数 ≈ 9.81 m/s²）
+- Gyroscope（rad/s）
+- Magnetometer（µT 量级）
+- `time`：纳秒（CSV 为 float64 科学计数，约 1 ms 精度）
 
 ### 3.3 与 Mousecrack 格式的映射
 
@@ -109,13 +115,16 @@ Mousecrack 当前训练格式（`data.jsonl`，每行一条轨迹）：
 }
 ```
 
-**转换规则（待下载后对照实际文件结构微调）：**
+**转换规则（已对照 v2 实测）：**
 
-1. 按 touch 事件序列中的 **down → move → up** 切分为独立 swipe
-2. `target` = 该 swipe 最后一个点的 `(x, y)`
-3. `timestamp` 归零为相对毫秒（以 swipe 起点为 0）
-4. 过滤：轨迹点数 < 3、总时长 < 50ms、或 `dt` 异常（≤ 0 或 > 500ms）的样本
-5. 可选保留 `pressure`、`area` 作为 path 点的附加字段
+1. 按 `id_swipe` 分组（不要按 down/move/up 再切；原始文件也未提供 action 字段）
+2. 同一毫秒多点：按时间排序后 **collapse（保留最后一点）**，否则约 17% 相邻点 `dt==0`
+3. `target` = 该 swipe 最后一个点的 `(x, y)`
+4. `timestamp` 归零为相对毫秒（touch 与 sensor **各自**以本 swipe 首点为 0）
+5. 过滤：collapse 后点数 < 3、总时长 < 50ms、或仍有 `dt > 500ms` 的样本
+6. 场景映射：`Normal` → `seated`，`Walking` → `walking`，`Stressful` → `stress`
+7. 可选保留 `pressure`、`touch_major`（作 area）
+8. Phase 2：用 `id_swipe` 取 sensor，把 sensor 时间 `/ 1e6` 成毫秒后按相对时间插值到 touch 点。**不要**把 touch 的 ms 与 sensor 的 ns 当同一时钟做绝对对齐
 
 **扩展格式（touch + sensor，供联合训练使用）：**
 
@@ -141,14 +150,11 @@ Mousecrack 当前训练格式（`data.jsonl`，每行一条轨迹）：
 }
 ```
 
-### 3.4 数据量预估
+### 3.4 数据量（实测）
 
-公开文档未给出精确 swipe 条数。按 50 × 2 × 3 场景、每场景约 30–100 次 swipe 估算：
+CSD4CA v2：**34,417** 条原始 swipe。按上节规则 collapse + 过滤后约 **33,058** 条可用（Normal 12,130 / Stressful 9,973 / Walking 10,955）。
 
-- **保守**：~4,500 条
-- **乐观**：~15,000 条
-
-对比 mousecrack 现有 ~25,000 条鼠标轨迹，规模略小但通常足够 LSTM+MDN 收敛。下载解压后应首先统计实际条数，再决定是否合并其他数据集。
+多于 mousecrack 的 25,000 条鼠标轨迹，**不需要合并其他数据集**。v1 多出来的 7,825 条是被 v2 丢掉的 8 名用户 + 编号场景后缀 + session 3，不要再并回去。
 
 ### 3.5 已知限制
 
@@ -157,7 +163,10 @@ Mousecrack 当前训练格式（`data.jsonl`，每行一条轨迹）：
 | 单一设备（Pixel 6a） | 换机型时 pressure/area 尺度可能不一致 | 训练时 z-score 归一化；输出时附带 `deviceProfile` |
 | 仅 50 用户 | 轨迹风格多样性有限 | MVP 可接受；后期加 AITouch / HuMIdb |
 | 仅 swipe | 不支持 tap、长按 | 第一版 scope 明确为 swipe |
-| 需格式转换 | 不能零成本直接使用 | 一次性转换脚本 |
+| 需格式转换 | 不能零成本直接使用 | 一次性转换脚本（按 `id_swipe` 分组） |
+| 同毫秒重复 touch 点 | 直接算 `dt` 会大量 ≤ 0 | collapse 后再过滤 |
+| touch 与 sensor 时钟不同 | 绝对时间对不上 | swipe 内相对时间 + `id_swipe` |
+| 加速度含重力 | 与线性加速度数据集不可混用 | 文档声明 `TYPE_ACCELEROMETER` |
 
 ---
 
@@ -341,27 +350,25 @@ touchtrace/
 ### 6.1 步骤
 
 ```
-1. 从 Zenodo 下载 SwipeMotionDB.rar
-2. 解压，梳理目录结构与文件命名（需在实现时对照实际内容）
-3. 运行 convert_swipemotiondb.py：
-   a. 解析 touch 事件流
-   b. 按 gesture 边界切段
+1. 使用已下载的 data/raw/CSD4CA/（不要用 v1 再切一遍）
+2. 运行 convert_swipemotiondb.py：
+   a. 按 id_swipe 分组 touch
+   b. 按 time 排序并 collapse 同一毫秒
    c. 时间戳归零、异常过滤
-   d. （Phase 2）按 timestamp 融合 sensor 流
+   d. （Phase 2）按 id_swipe 取 sensor，相对时间插值
    e. 写出 touch_data.jsonl / touch_sensor_data.jsonl
-4. 输出统计报告：
-   - 总轨迹数、每场景分布、平均路径长度、dt 分布
-   - 若 < 5,000 条，标记警告并建议合并 CSD4CA
+3. 输出统计报告：总轨迹数、每场景分布、平均路径长度、dt 分布
 ```
 
 ### 6.2 转换脚本职责（`convert_swipemotiondb.py`）
 
 | 功能 | 说明 |
 |------|------|
-| `parse_touch_events(path)` | 读取 touch 原始文件，返回事件列表 |
-| `segment_swipes(events)` | down/move/up 切段 |
+| `parse_touch_events(path)` | 读取 CSD4CA `touch_data.csv` |
+| `group_swipes(rows)` | 按 `id_swipe` 分组（无 action 字段） |
+| `collapse_timestamps(path)` | 同 ms 保留最后一点，再排序 |
 | `normalize_timestamps(path)` | 相对毫秒 |
-| `merge_sensors(touch_path, sensor_dir)` | 时间对齐融合 |
+| `merge_sensors(touch_path, sensor_dir)` | 按 `id_swipe` + 相对时间插值 |
 | `filter_trajectory(traj)` | 长度、dt、坐标合法性 |
 | `write_jsonl(trajectories, out_path)` | 输出训练格式 |
 | `print_stats(trajectories)` | 打印数据集摘要 |
@@ -370,8 +377,8 @@ touchtrace/
 
 转换完成后应验证：
 
-- [ ] 轨迹数 ≥ 3,000（否则考虑补充数据）
-- [ ] 无 `dt <= 0` 的相邻点对
+- [ ] 轨迹数 ≥ 3,000（v2 预期约 33k，远超此线）
+- [ ] collapse 之后无 `dt <= 0` 的相邻点对
 - [ ] `target` 与 `path` 末点一致（或误差 < 2px）
 - [ ] seated / walking / stress 三类均有足够样本
 - [ ] Phase 2：每个 touch 点均有对应 sensor 读数（或插值标记）
@@ -514,12 +521,12 @@ mousecrack touch-sensor-steps <fromX> <fromY> <toX> <toY> [standard|lite] [--no-
 
 ### Phase 0：准备（预估 1–2 天）
 
-- [ ] 下载并解压 SwipeMotionDB
-- [ ] 文档化实际文件结构与字段名
-- [ ] 统计原始 swipe 条数与场景分布
-- [ ] 确认是否需合并 CSD4CA
+- [x] 下载并解压 SwipeMotionDB（v1）以及同记录的 CSD4CA（v2）
+- [x] 文档化实际文件结构与字段名
+- [x] 统计原始 swipe 条数与场景分布
+- [x] 确认是否需合并 CSD4CA → **否**；v2 即清洗版，作为训练源
 
-**交付物**：数据探索笔记（可追加到本文档附录）
+**交付物**：附录 C
 
 ---
 
@@ -577,7 +584,7 @@ mousecrack touch-sensor-steps <fromX> <fromY> <toX> <toY> [standard|lite] [--no-
 
 | 风险 | 概率 | 影响 | 应对 |
 |------|------|------|------|
-| SwipeMotionDB 实际条数 < 3k | 中 | 模型欠拟合 | 合并 CSD4CA 或 AITouch |
+| SwipeMotionDB 实际条数 < 3k | ~~中~~ 已排除 | — | v2 过滤后仍约 33k 条 |
 | 文件格式与文档不符 | 中 | 转换脚本需重写 | Phase 0 先探索再编码 |
 | 单设备导致泛化差 | 中 | 换机型输出失真 | 文档声明 device profile；后期多设备数据 |
 | Sensor 双头训练不稳定 | 中 | Phase 2 延期 | 先独立训 sensor 头；或降维至 6 维 |
@@ -658,4 +665,83 @@ Touch 扩展 Phase 1 可直接沿用，无需改模型结构。
 
 ---
 
-*文档版本：1.0 | 最后更新：2026-08-26*
+## 附录 C：Phase 0 数据探索笔记（2026-08-27）
+
+### C.1 下载
+
+| 文件 | URL | 大小 | md5 |
+|------|-----|------|-----|
+| `SwipeMotionDB.rar` | https://zenodo.org/api/records/17171888/files/SwipeMotionDB.rar/content | 167.8 MiB | `ed7dead38de41a4f32f00bea74c300b0` |
+| `CSD4CA.rar` | https://zenodo.org/api/records/17931118/files/CSD4CA.rar/content | 120.6 MiB | `0283426398f3d71f185e98d811a60ed3` |
+
+Zenodo 页面提示 v1「有更新版本」：concept record `17171887` 的 latest 就是 CSD4CA v2。v2 的 alternative title 仍是 SwipeMotionDB。解压后放在 `data/raw/`（已 gitignore）。
+
+### C.2 目录与字段
+
+**v1** `data/raw/SwipeMotionDB/`
+
+```
+acc_data.csv      430 MB   4,572,054 行
+gyro_data.csv     458 MB   4,616,641 行
+magneto_data.csv   91 MB   1,012,145 行
+touch_data.csv    217 MB   2,063,239 行
+users_info.csv    2.6 KB   58 行
+```
+
+v1 touch 列：`session, activity, scenario, user_id, used_hand, age, gender, id_swipe, time, x, y, touch_major, touch_minor, pressure, finger_size`（另有 unnamed index）。`activity` 恒为 `facebook`。
+
+**v2** `data/raw/CSD4CA/`：同上四个 CSV，**无** `users_info.csv`，**无** `activity` 与 unnamed index。sensor 的 `accuracy` 写成 `1.0` 这类 float。
+
+`users_info`（仅 v1）：`user_id, age, usedHand, gender, xdpi, ydpi, density, heightPixels, widthPixels`。全部用户屏幕相同：1080×2142，density 2.625，xdpi 428.625（Pixel 6a）。利手 r=53 / l=5。
+
+### C.3 条数与分布
+
+| | v1 | v2（训练源） |
+|--|----|----------------|
+| 用户 | 58（id 4–69，有空号） | 50（去掉 8, 12, 25, 43, 44, 56, 63, 68） |
+| 原始 swipe | 42,242 | 34,417（⊂ v1，user/session 全对得上） |
+| session | 1: 23,208；2: 19,031；3: 3 | 1: 17,155；2: 17,262 |
+| 场景 | Normal / Walking / Stressful + 编号后缀 | 仅三个主标签 |
+| collapse+过滤后 | 40,521（95.9%） | **33,058**（96.0%） |
+| 过滤后场景 | seated 14,557 / stress 13,786 / walking 12,178 | Normal 12,130 / Stressful 9,973 / Walking 10,955 |
+
+v2 丢掉的 8 人含 v1 中 age=11 的 user 68。v1 里 age=13 的 user 69 在 v2 中年龄改为 31（与同 id 轨迹仍重叠），v2 无 18 岁以下标注。
+
+v2 过滤后轨迹：点数 p50=31、时长 p50≈193 ms、位移 p50≈406 px。每人约 300–900 条 swipe。
+
+**结论：不合并、不用 v1 补数据。** 33k 已超过 mouse 的 25k。
+
+### C.4 时间戳与对齐
+
+- **Touch `time`**：毫秒。例 `36949252`，同一 swipe 跨度中位数 ~190 ms。相邻 `dt` 均值约 5 ms（~200 Hz）。
+- **Sensor `time`**：纳秒。例 `7.851710827e+14`。与 touch 跨度之比中位数 ≈ 9.75×10⁵（即 1e6，ns vs ms）。
+- 两个时钟**原点不同**，不能 `sensor_ns/1e6` 去对 touch 的绝对 ms。按 `id_swipe` 分组后，各自减首点再插值。
+- v2 中 34,417 条 swipe 几乎都有三路 sensor；v1 四模态齐全 41,965 / 42,242。
+- Acc 有极少数跨度异常（v1 有一条 span ~367,320 s），转换时应丢掉 sensor 跨度 ≫ touch 时长的 swipe 的 sensor 流。
+- Sensor CSV 存在空 `time` / 空 `x`（v1 acc 约 17k 空时间），跳过即可。
+
+### C.5 `dt<=0` 不是坏轨迹
+
+v1 相邻 touch 点：`dt>0` 1,661,535；`dt==0` 358,621；`dt<0` 359。
+
+`dt==0` 里约 78k 为同坐标重复，约 280k 为**同一毫秒的不同坐标**（Android 把多次 MOVE 打到同一 ms）。若按「整条轨迹有 dt≤0 就丢」，会丢掉 83% 样本。
+
+正确做法：按 `time` 排序 → 同一 `time` 只留最后一点 → 再应用点数 / 时长 / `dt>500` 过滤。之后 `dt<=0` 为 0，v2 可留 33,058 条。
+
+### C.6 对转换脚本的含义
+
+`convert_swipemotiondb.py` 应读 **`data/raw/CSD4CA/*.csv`**：
+
+| 原设想 | 实际 |
+|--------|------|
+| `segment_swipes`（down/move/up） | 不需要；用 `id_swipe` |
+| 估计 4.5k–15k 条 | 直接用 v2 的 34k |
+| 合并 CSD4CA | 禁止；那就是 v2 本身 |
+| 按绝对时间融合 sensor | 按 `id_swipe` + 相对时间 |
+| `area` 字段 | 用 `touch_major`（中位数 ~176 px）或 `finger_size`（~0.076） |
+
+`deviceProfile` 可写死：`pixel-6a`，1080×2142，xdpi 428.625。
+
+---
+
+*文档版本：1.1 | 最后更新：2026-08-27*

@@ -4,3 +4,4 @@ __pycache__
 node_modules/
 inference/README.md
 inference/dist
+data/

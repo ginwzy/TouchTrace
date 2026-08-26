@@ -15,7 +15,7 @@ This project is under active development. See [TOUCH_EXTENSION_PLAN.md](./TOUCH_
 
 | Phase | Scope | Status |
 |-------|--------|--------|
-| Phase 0 | SwipeMotionDB exploration | Planned |
+| Phase 0 | SwipeMotionDB exploration | Done — see plan appendix C |
 | Phase 1 | Touch trajectory JSON output | Planned |
 | Phase 2 | Touch + sensor bundle output | Planned |
 
