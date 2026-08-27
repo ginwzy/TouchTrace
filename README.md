@@ -116,14 +116,16 @@ python train.py
 python convert.py
 ```
 
-Touch model (after CSD4CA jsonl exists at `train/touch/touch_data.jsonl`):
+Touch model (`touch_data.jsonl.gz` is in the repo; weights are not — train locally or on Colab):
 
 ```bash
 cd train/touch
 python -m pytest -q
-python train_touch.py
+python train_touch.py          # prepad + batch 256 by default
 python convert_touch.py
 ```
+
+**Google Colab (GPU):** upload or open [`notebooks/train_touch_colab.ipynb`](notebooks/train_touch_colab.ipynb), set runtime to GPU, run all cells.
 
 ---
 
