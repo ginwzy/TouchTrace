@@ -16,7 +16,7 @@ This project is under active development. See [TOUCH_EXTENSION_PLAN.md](./TOUCH_
 | Phase | Scope | Status |
 |-------|--------|--------|
 | Phase 0 | SwipeMotionDB exploration | Done — see plan appendix C |
-| Phase 1 | Touch trajectory JSON output | Planned |
+| Phase 1 | Touch trajectory JSON output | Working — remaining-frame LSTM+MDN, no-backtrack generation |
 | Phase 2 | Touch + sensor bundle output | Planned |
 
 The repository currently includes the **LSTM + MDN** training and inference pipeline (originally from [mousecrack](https://github.com/puffinsoft/mousecrack)), which serves as the foundation for touch model training.
@@ -27,7 +27,7 @@ The repository currently includes the **LSTM + MDN** training and inference pipe
 
 TouchTrace treats movement prediction as a **multivariate time series** problem:
 
-- **Input**: previous step `(dx, dy, dt)` and remaining distance to target `(dist_x, dist_y)`
+- **Input**: previous step in remaining-aligned `(tangent, normal, dt)` plus remaining distance to the target
 - **Output**: next step `(dx, dy, dt)` sampled from a Mixture Density Network (MDN)
 - **Generation**: autoregressive loop until the path reaches the target
 
@@ -47,29 +47,22 @@ npm i -g touchtrace
 
 ## Usage
 
-Output-only API (planned):
+Output-only API:
 
 ```js
-import { touchSteps, touchSensorSteps } from 'touchtrace';
+import { touchSteps } from 'touchtrace';
 
 const path = await touchSteps(
   { x: 100, y: 800 },
   { x: 540, y: 1200 }
 );
 // [{ x: 100, y: 800, t: 0 }, { x: 105, y: 798, t: 16.2 }, ...]
-
-const bundle = await touchSensorSteps(
-  { x: 100, y: 800 },
-  { x: 540, y: 1200 }
-);
-// { touch: [...], sensors: [{ t, accel, gyro, mag }, ...] }
 ```
 
-CLI (planned):
+CLI:
 
 ```bash
 touchtrace touch-steps 100 800 540 1200
-touchtrace touch-sensor-steps 100 800 540 1200
 ```
 
 ### Legacy mouse API
@@ -92,10 +85,10 @@ touchtrace steps 100 200 200 400
 
 Two model sizes are supported:
 
-| Model | Architecture | Notes |
-|-------|--------------|-------|
-| **Standard** | 2×128 LSTM | Recommended |
-| **Lite** | 2×64 LSTM | Faster inference, but paths may veer off course |
+| Model | File | Notes |
+|-------|------|-------|
+| **Touch** | `touch.onnx` | Remaining-frame LSTM+MDN, no-backtrack. In `inference/public/` |
+| **Mouse** | `model.onnx` / `model_lite.onnx` | Legacy mouse pipeline |
 
 ---
 
@@ -116,7 +109,7 @@ python train.py
 python convert.py
 ```
 
-Touch model (`touch_data.jsonl.gz` is in the repo; weights are not — train locally or on Colab):
+Touch model (`inference/public/touch.onnx`; training data is `train/touch/touch_data.jsonl.gz`):
 
 ```bash
 # uv venv (project root)
@@ -127,12 +120,11 @@ uv sync
 
 cd train/touch
 python -m pytest -q
-python train_touch.py          # subsample + weighted loss + geom aug + angle weights
-python convert_touch.py
-python eval_generate.py --model touch.onnx   # raw / no-backtrack / guided, by angle
-python preview_swipes.py --model touch.onnx --from-data --raw
-python preview_swipes.py --model touch.onnx --from-data --noback
-python preview_swipes.py --model touch.onnx --from-data
+python train_touch.py          # remaining-frame LSTM+MDN
+python convert_touch.py        # writes train/touch/touch.onnx and inference/public/touch.onnx
+python eval_generate.py        # real vs raw vs no-backtrack: bow, duration, step size
+python preview_swipes.py --from-data
+python preview_swipes.py --from-data --raw
 ```
 
 **Google Colab (GPU):** open [`notebooks/train_touch_colab.ipynb`](notebooks/train_touch_colab.ipynb), set runtime to GPU, run all cells.

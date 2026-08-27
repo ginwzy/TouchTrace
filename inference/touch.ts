@@ -3,7 +3,7 @@ import { join } from 'path';
 
 import { ModelType } from './config.ts';
 import { model_config, touch_model_config } from './config.ts';
-import { sampleFromMDN, smoothPath, paramsSize } from './util.ts';
+import { sampleFromMDN, paramsSize } from './util.ts';
 import type { Position, Step } from './index.ts';
 
 const touchSessions: Partial<Record<ModelType, Promise<ort.InferenceSession>>> = {};
@@ -42,61 +42,55 @@ function fromRemainingFrame(tan: number, nrm: number, remX: number, remY: number
     return { dx: c * tan - s * nrm, dy: s * tan + c * nrm };
 }
 
-interface GuidedOptions {
+const ARRIVE_PX = 3;
+
+export interface TouchGenerateOptions {
     maxSteps?: number;
     minStepPx?: number;
     maxStepPx?: number;
-    snapPx?: number;
     avgStepPx?: number;
-    smooth?: boolean;
 }
 
-function applyGuidedStep(
-    cx: number,
-    cy: number,
-    end: Position,
+function applyNoBacktrackStep(
+    remX: number,
+    remY: number,
+    dist: number,
     dx: number,
     dy: number,
     minStepPx: number,
-    maxStepPx: number,
-    snapPx: number,
-): { dx: number; dy: number; snapped: boolean } {
-    const dist = Math.hypot(end.x - cx, end.y - cy);
-    if (dist < snapPx) {
-        return { dx: end.x - cx, dy: end.y - cy, snapped: true };
+): { dx: number; dy: number } {
+    if (dist < 1) {
+        return { dx, dy };
     }
-
-    const tx = (end.x - cx) / dist;
-    const ty = (end.y - cy) / dist;
-    let mag = Math.hypot(dx, dy);
-    const dot = dx * tx + dy * ty;
-
-    if (dot < 0 || mag < minStepPx) {
-        mag = Math.min(Math.max(minStepPx, mag), maxStepPx, dist * 0.35);
-        dx = tx * mag;
-        dy = ty * mag;
-    } else if (mag > Math.max(dist, maxStepPx)) {
-        const step = Math.min(dist, maxStepPx);
-        dx = tx * step;
-        dy = ty * step;
+    const tx = remX / dist;
+    const ty = remY / dist;
+    if (dx * tx + dy * ty >= 0) {
+        return { dx, dy };
     }
+    const mag = Math.max(Math.hypot(dx, dy), minStepPx);
+    return { dx: tx * mag, dy: ty * mag };
+}
 
-    return { dx, dy, snapped: false };
+function clampStepMag(dx: number, dy: number, maxStepPx: number): { dx: number; dy: number } {
+    const mag = Math.hypot(dx, dy);
+    if (mag > maxStepPx && maxStepPx > 0) {
+        const scale = maxStepPx / mag;
+        return { dx: dx * scale, dy: dy * scale };
+    }
+    return { dx, dy };
 }
 
 async function generateTouchPath(
     session: ort.InferenceSession,
     start: Position,
     end: Position,
-    options: GuidedOptions = {},
+    options: TouchGenerateOptions = {},
 ): Promise<Step[]> {
     const {
         maxSteps = 500,
         minStepPx = 3,
         maxStepPx = 35,
-        snapPx = 15,
         avgStepPx = 13,
-        smooth = true,
     } = options;
 
     let currX = start.x;
@@ -117,7 +111,7 @@ async function generateTouchPath(
 
     for (let step = 0; step < stepBudget; step++) {
         const dist = Math.hypot(end.x - currX, end.y - currY);
-        if (dist < 3) break;
+        if (dist < ARRIVE_PX) break;
 
         const remX = end.x - currX;
         const remY = end.y - currY;
@@ -139,17 +133,8 @@ async function generateTouchPath(
         const dt = sampled.dt;
         const dtStep = dt > 0 ? dt : model_config.minDelayMs;
 
-        const guided = applyGuidedStep(currX, currY, end, dx, dy, minStepPx, maxStepPx, snapPx);
-        dx = guided.dx;
-        dy = guided.dy;
-
-        if (guided.snapped) {
-            currX = end.x;
-            currY = end.y;
-            elapsedMs += Math.max(dtStep, model_config.minDelayMs);
-            path.push({ x: Math.round(currX), y: Math.round(currY), t: elapsedMs });
-            break;
-        }
+        ({ dx, dy } = applyNoBacktrackStep(remX, remY, dist, dx, dy, minStepPx));
+        ({ dx, dy } = clampStepMag(dx, dy, maxStepPx));
 
         currX += dx;
         currY += dy;
@@ -162,17 +147,19 @@ async function generateTouchPath(
         lastDtStep = dtStep;
     }
 
-    elapsedMs += lastDtStep;
-    path.push({ x: Math.round(end.x), y: Math.round(end.y), t: elapsedMs });
+    if (Math.hypot(path[path.length - 1].x - end.x, path[path.length - 1].y - end.y) >= ARRIVE_PX) {
+        elapsedMs += lastDtStep;
+        path.push({ x: Math.round(end.x), y: Math.round(end.y), t: elapsedMs });
+    }
 
-    return smooth ? smoothPath(path, 7) : path;
+    return path;
 }
 
 export async function touchSteps(
     start: Position,
     end: Position,
     type?: ModelType,
-    options?: GuidedOptions,
+    options?: TouchGenerateOptions,
 ): Promise<Step[]> {
     const session = await getTouchSession(type);
     return generateTouchPath(session, start, end, options);

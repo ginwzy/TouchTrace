@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from config_touch import model_config
+from generate import inference_public_onnx
 from train_touch import build_touch_model
 
 
@@ -38,6 +40,10 @@ def export_onnx(lite: bool = False, weights: Path | None = None, output: Path | 
     spec = (tf.TensorSpec((1, None, model_config["input_dims"]), tf.float32, name="input"),)
     tf2onnx.convert.from_keras(export_model, input_signature=spec, output_path=str(out_path))
     print("Conversion complete.")
+    public = inference_public_onnx(out_path.name)
+    if public.parent.is_dir() and public.resolve() != out_path.resolve():
+        shutil.copy2(out_path, public)
+        print(f"Copied to {public}")
     return out_path
 
 

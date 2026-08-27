@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from features import from_remaining_frame, to_remaining_frame
+from features import from_remaining_frame, remaining_frame_axes, to_remaining_frame
 
 if TYPE_CHECKING:
     import onnxruntime as ort
@@ -23,8 +23,9 @@ PARAMS_SIZE = COMPONENTS * (1 + 2 * OUTPUT_DIMS)
 # Training-set step stats (CSD4CA): median step ~5px, p90 ~32px.
 DEFAULT_MIN_STEP_PX = 3.0
 DEFAULT_MAX_STEP_PX = 35.0
-DEFAULT_SNAP_PX = 15.0
 DEFAULT_AVG_STEP_PX = 13.0
+# Loop stop / optional target append. Distinct from min_step_px (training subsample).
+ARRIVE_PX = 3.0
 
 
 @dataclass(frozen=True)
@@ -39,14 +40,29 @@ class GenerateOptions:
     max_steps: int = 500
     min_step_px: float = DEFAULT_MIN_STEP_PX
     max_step_px: float = DEFAULT_MAX_STEP_PX
-    snap_px: float = DEFAULT_SNAP_PX
     avg_step_px: float = DEFAULT_AVG_STEP_PX
-    guided: bool = True
-    no_backtrack: bool = False
-    smooth: bool = True
-    smooth_window: int = 7
+    no_backtrack: bool = True
     seed: int | None = None
     remaining_frame: bool = True
+
+
+def inference_public_onnx(name: str = "touch.onnx") -> Path:
+    return Path(__file__).resolve().parent.parent.parent / "inference" / "public" / name
+
+
+def default_onnx_path() -> Path:
+    here = Path(__file__).resolve().parent
+    candidates = (here / "touch.onnx", inference_public_onnx())
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[-1]
+
+
+def default_data_path() -> Path:
+    here = Path(__file__).resolve().parent
+    gz = here / "touch_data.jsonl.gz"
+    return gz if gz.exists() else here / "touch_data.jsonl"
 
 
 def softplus(x: float) -> float:
@@ -65,56 +81,6 @@ def sample_from_mdn(params: np.ndarray, rng: np.random.Generator) -> tuple[float
     return float(sample[0]), float(sample[1]), float(sample[2])
 
 
-def smooth_path(path: list[TouchStep], window_size: int = 7) -> list[TouchStep]:
-    if len(path) < window_size:
-        return path
-    half = window_size // 2
-    smoothed = [path[0]]
-    for i in range(1, len(path) - 1):
-        start = max(0, i - half)
-        end = min(len(path), i + half + 1)
-        window = path[start:end]
-        smoothed.append(
-            TouchStep(
-                x=round(sum(p.x for p in window) / len(window)),
-                y=round(sum(p.y for p in window) / len(window)),
-                t=path[i].t,
-            )
-        )
-    smoothed.append(path[-1])
-    return smoothed
-
-
-def _guided_step(
-    cx: float,
-    cy: float,
-    end: tuple[float, float],
-    dx: float,
-    dy: float,
-    *,
-    min_step_px: float,
-    max_step_px: float,
-    snap_px: float,
-) -> tuple[float, float, bool]:
-    dist = math.hypot(end[0] - cx, end[1] - cy)
-    if dist < snap_px:
-        return end[0] - cx, end[1] - cy, True
-
-    tx = (end[0] - cx) / dist
-    ty = (end[1] - cy) / dist
-    mag = math.hypot(dx, dy)
-    dot = dx * tx + dy * ty
-
-    if dot < 0 or mag < min_step_px:
-        mag = min(max(min_step_px, mag), max_step_px, dist * 0.35)
-        dx, dy = tx * mag, ty * mag
-    elif mag > max(dist, max_step_px):
-        step = min(dist, max_step_px)
-        dx, dy = tx * step, ty * step
-
-    return dx, dy, False
-
-
 def _no_backtrack_step(
     cx: float,
     cy: float,
@@ -124,16 +90,22 @@ def _no_backtrack_step(
     min_step_px: float,
 ) -> tuple[float, float]:
     """If the sampled step points away from the target, redirect it along the remaining vector."""
-    rem_x = end[0] - cx
-    rem_y = end[1] - cy
-    dist = math.hypot(rem_x, rem_y)
+    c, s, dist = remaining_frame_axes(end[0] - cx, end[1] - cy)
     if dist < 1.0:
         return dx, dy
-    tx, ty = rem_x / dist, rem_y / dist
-    if dx * tx + dy * ty >= 0:
+    if dx * c + dy * s >= 0:
         return dx, dy
     mag = max(math.hypot(dx, dy), min_step_px)
-    return tx * mag, ty * mag
+    return c * mag, s * mag
+
+
+def _clamp_step_mag(dx: float, dy: float, max_step_px: float) -> tuple[float, float]:
+    """Cap a step to max_step_px, keeping its direction."""
+    mag = math.hypot(dx, dy)
+    if mag > max_step_px > 0:
+        scale = max_step_px / mag
+        return dx * scale, dy * scale
+    return dx, dy
 
 
 def generate_touch_path(
@@ -161,7 +133,7 @@ def generate_touch_path(
 
     for _ in range(step_budget):
         dist = math.hypot(end[0] - cx, end[1] - cy)
-        if dist < 3.0:
+        if dist < ARRIVE_PX:
             break
 
         rem_x = end[0] - cx
@@ -180,24 +152,9 @@ def generate_touch_path(
             dx, dy = d0, d1
         dt_step = dt if dt > 0 else MIN_DELAY_MS
 
-        if opts.guided:
-            dx, dy, snapped = _guided_step(
-                cx,
-                cy,
-                end,
-                dx,
-                dy,
-                min_step_px=opts.min_step_px,
-                max_step_px=opts.max_step_px,
-                snap_px=opts.snap_px,
-            )
-            if snapped:
-                cx, cy = end[0], end[1]
-                elapsed_ms += max(dt_step, MIN_DELAY_MS)
-                path.append(TouchStep(x=round(cx), y=round(cy), t=elapsed_ms))
-                break
-        elif opts.no_backtrack:
+        if opts.no_backtrack:
             dx, dy = _no_backtrack_step(cx, cy, end, dx, dy, opts.min_step_px)
+        dx, dy = _clamp_step_mag(dx, dy, opts.max_step_px)
 
         cx += dx
         cy += dy
@@ -206,11 +163,10 @@ def generate_touch_path(
         dx_prev, dy_prev, dt_prev = dx, dy, dt_step
         last_dt = dt_step
 
-    elapsed_ms += last_dt
-    path.append(TouchStep(x=round(end[0]), y=round(end[1]), t=elapsed_ms))
+    if math.hypot(path[-1].x - end[0], path[-1].y - end[1]) >= ARRIVE_PX:
+        elapsed_ms += last_dt
+        path.append(TouchStep(x=round(end[0]), y=round(end[1]), t=elapsed_ms))
 
-    if opts.smooth:
-        path = smooth_path(path, opts.smooth_window)
     return path
 
 

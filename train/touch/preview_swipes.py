@@ -11,7 +11,7 @@ import numpy as np
 
 from config_touch import model_config
 from features import swipe_angle_bucket
-from generate import GenerateOptions, TouchStep, generate_touch_path, load_session
+from generate import GenerateOptions, TouchStep, default_data_path, default_onnx_path, generate_touch_path, load_session
 
 SCREEN_W, SCREEN_H = 1080, 2142
 
@@ -22,12 +22,6 @@ DEFAULT_SWIPES = [
     ("short diagonal", (100, 800), (540, 1200)),
     ("long diagonal", (80, 1900), (950, 350)),
 ]
-
-
-def _resolve_data_path() -> Path:
-    gz = Path(__file__).resolve().parent / "touch_data.jsonl.gz"
-    jsonl = Path(__file__).resolve().parent / "touch_data.jsonl"
-    return gz if gz.exists() else jsonl
 
 
 def _swipes_from_val(data_path: Path, seed: int = 42) -> list[tuple[str, tuple[float, float], tuple[float, float]]]:
@@ -93,20 +87,11 @@ def plot_swipes(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate and plot touch swipes from touch.onnx")
-    parser.add_argument(
-        "--model",
-        type=Path,
-        default=Path("/home/users/nate/Downloads/train/new/touch.onnx"),
-    )
+    parser.add_argument("--model", type=Path, default=None)
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--raw", action="store_true", help="Disable guided steering and smoothing")
-    parser.add_argument(
-        "--noback",
-        action="store_true",
-        help="Raw MDN but redirect reverse steps toward the target",
-    )
+    parser.add_argument("--raw", action="store_true", help="Unconstrained MDN (no reverse-step redirect)")
     parser.add_argument(
         "--from-data",
         action="store_true",
@@ -114,27 +99,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    out_dir = args.out_dir or args.model.parent / "plots"
+    model = args.model or default_onnx_path()
+    out_dir = args.out_dir or model.parent / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.noback:
-        opts = GenerateOptions(guided=False, smooth=False, no_backtrack=True, seed=args.seed)
-        mode = "raw + no-backtrack"
-        suffix = "swipes_noback.png"
-    elif args.raw:
-        opts = GenerateOptions(guided=False, smooth=False, seed=args.seed)
-        mode = "raw MDN"
+    if args.raw:
+        opts = GenerateOptions(no_backtrack=False, seed=args.seed)
+        mode_label = "raw MDN"
         suffix = "swipes_raw.png"
     else:
-        opts = GenerateOptions(smooth=True, seed=args.seed)
-        mode = "guided + smooth"
-        suffix = "swipes_guided.png"
+        opts = GenerateOptions(no_backtrack=True, seed=args.seed)
+        mode_label = "no-backtrack"
+        suffix = "swipes_noback.png"
 
-    swipes = _swipes_from_val(_resolve_data_path()) if args.from_data else DEFAULT_SWIPES
+    swipes = _swipes_from_val(default_data_path()) if args.from_data else DEFAULT_SWIPES
     if args.from_data:
         suffix = suffix.replace(".png", "_val.png")
 
-    session = load_session(args.model)
+    session = load_session(model)
     groups = []
 
     for idx, (label, start, end) in enumerate(swipes):
@@ -147,7 +129,7 @@ def main() -> None:
         print(f"{label}: {len(p0)} points, {p0[-1].t:.0f} ms")
 
     grid_path = out_dir / suffix
-    plot_swipes(groups, grid_path, f"TouchTrace generated swipes ({mode})")
+    plot_swipes(groups, grid_path, f"TouchTrace generated swipes ({mode_label})")
     print(f"\nSaved: {grid_path}")
 
 

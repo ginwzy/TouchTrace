@@ -27,7 +27,7 @@ touchtrace touch-sensor-steps <fromX> <fromY> <toX> <toY>
 SDK usage:
 
 ```js
-import { touchSteps, touchSensorSteps } from 'touchtrace';
+import { touchSteps } from 'touchtrace';
 
 const path = await touchSteps({ x: 100, y: 800 }, { x: 540, y: 1200 });
 ```

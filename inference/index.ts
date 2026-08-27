@@ -8,6 +8,7 @@ import { smoothPath, sampleFromMDN, sleep, paramsSize } from './util.ts';
 import { ModelType } from './config.ts';
 export { ModelType } from './config.ts';
 export { touchSteps } from './touch.ts';
+export type { TouchGenerateOptions } from './touch.ts';
 
 export interface Position {
     x: number;
