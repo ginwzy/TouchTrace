@@ -116,6 +116,15 @@ python train.py
 python convert.py
 ```
 
+Touch model (after CSD4CA jsonl exists at `train/touch/touch_data.jsonl`):
+
+```bash
+cd train/touch
+python -m pytest -q
+python train_touch.py
+python convert_touch.py
+```
+
 ---
 
 ## Attribution

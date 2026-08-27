@@ -535,7 +535,7 @@ mousecrack touch-sensor-steps <fromX> <fromY> <toX> <toY> [standard|lite] [--no-
 | 任务 | 优先级 | 状态 |
 |------|--------|------|
 | `convert_swipemotiondb.py` | P0 | 完成（33,058 条 jsonl） |
-| `train_touch.py` + `touch_data.jsonl` | P0 | |
+| `train_touch.py` + `touch_data.jsonl` | P0 | 全量训练进行中（截断 128 + Metal） |
 | 导出 `touch.onnx` | P0 | |
 | `inference/touch.ts` — `touchSteps()` | P0 | |
 | CLI `touch-steps` 子命令 | P1 | |

@@ -7,3 +7,5 @@ inference/dist
 data/
 train/touch/touch_data.jsonl
 train/touch/touch_sensor_data.jsonl
+train/touch/train.log
+train/touch/model_checkpoint_epoch_*.h5
