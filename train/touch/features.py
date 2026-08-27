@@ -4,12 +4,34 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
 
 DEFAULT_MAX_STEPS = 128
+
+
+def subsample_path(path: list[dict], min_step_px: float = 0.0) -> list[dict]:
+    """Keep endpoints; drop intermediate points until movement >= min_step_px."""
+    if min_step_px <= 0 or len(path) < 2:
+        return path
+
+    out = [path[0]]
+    anchor = path[0]
+    ax, ay = float(anchor["x"]), float(anchor["y"])
+
+    for pt in path[1:]:
+        px, py = float(pt["x"]), float(pt["y"])
+        if math.hypot(px - ax, py - ay) >= min_step_px:
+            out.append(pt)
+            anchor = pt
+            ax, ay = px, py
+
+    if out[-1] is not path[-1]:
+        out.append(path[-1])
+    return out
 
 
 def encode_trajectory(path: list[dict], target: dict) -> tuple[list[list[float]], list[list[float]]]:
@@ -38,6 +60,21 @@ def encode_trajectory(path: list[dict], target: dict) -> tuple[list[list[float]]
     return X, Y
 
 
+def compute_sample_weights(
+    X: np.ndarray,
+    Y: np.ndarray,
+    pad: float,
+    step_weight: float,
+    dist_weight: float,
+) -> np.ndarray:
+    """Per-timestep loss weights: emphasize larger steps and far-from-target states."""
+    mask = Y[:, :, 0] != pad
+    step_mag = np.sqrt(Y[:, :, 0] ** 2 + Y[:, :, 1] ** 2)
+    dist = np.sqrt(X[:, :, 3] ** 2 + X[:, :, 4] ** 2)
+    weights = 1.0 + step_weight * step_mag + dist_weight * dist
+    return (weights * mask).astype(np.float32)
+
+
 def _open_jsonl(filepath: str | Path):
     path = Path(filepath)
     if path.suffix == ".gz":
@@ -46,7 +83,9 @@ def _open_jsonl(filepath: str | Path):
 
 
 def iter_encoded_trajectories(
-    filepath: str | Path, max_steps: int | None = DEFAULT_MAX_STEPS
+    filepath: str | Path,
+    max_steps: int | None = DEFAULT_MAX_STEPS,
+    min_step_px: float = 0.0,
 ) -> Iterator[tuple[list[list[float]], list[list[float]]]]:
     with _open_jsonl(filepath) as f:
         for line in f:
@@ -54,7 +93,10 @@ def iter_encoded_trajectories(
             if not line:
                 continue
             data = json.loads(line)
-            x_seq, y_seq = encode_trajectory(data.get("path", []), data["target"])
+            path = subsample_path(data.get("path", []), min_step_px=min_step_px)
+            if len(path) < 2:
+                continue
+            x_seq, y_seq = encode_trajectory(path, data["target"])
             if max_steps is not None:
                 x_seq = x_seq[:max_steps]
                 y_seq = y_seq[:max_steps]
@@ -64,11 +106,15 @@ def iter_encoded_trajectories(
 
 
 def load_trajectory_sequences(
-    filepath: str | Path, max_steps: int | None = DEFAULT_MAX_STEPS
+    filepath: str | Path,
+    max_steps: int | None = DEFAULT_MAX_STEPS,
+    min_step_px: float = 0.0,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
-    for x_seq, y_seq in iter_encoded_trajectories(filepath, max_steps=max_steps):
+    for x_seq, y_seq in iter_encoded_trajectories(
+        filepath, max_steps=max_steps, min_step_px=min_step_px
+    ):
         xs.append(np.asarray(x_seq, dtype=np.float32))
         ys.append(np.asarray(y_seq, dtype=np.float32))
     return xs, ys
@@ -78,10 +124,13 @@ def load_trajectory_jsonl(
     filepath: str | Path,
     pad: float = -999999.0,
     max_steps: int | None = DEFAULT_MAX_STEPS,
+    min_step_px: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     X_all: list[list[list[float]]] = []
     Y_all: list[list[list[float]]] = []
-    for x_seq, y_seq in iter_encoded_trajectories(filepath, max_steps=max_steps):
+    for x_seq, y_seq in iter_encoded_trajectories(
+        filepath, max_steps=max_steps, min_step_px=min_step_px
+    ):
         X_all.append(x_seq)
         Y_all.append(y_seq)
     return _pad(X_all, pad), _pad(Y_all, pad)
@@ -97,3 +146,14 @@ def _pad(sequences: list[list[list[float]]], pad: float) -> np.ndarray:
         arr = np.asarray(seq, dtype=np.float32)
         out[i, : len(seq)] = arr
     return out
+
+
+def summarize_encoded_lengths(filepath: str | Path, min_step_px: float = 0.0) -> dict[str, float]:
+    lengths = [len(y) for _, y in iter_encoded_trajectories(filepath, min_step_px=min_step_px)]
+    arr = np.array(lengths, dtype=np.float32)
+    return {
+        "count": float(len(arr)),
+        "len_min": float(arr.min()) if len(arr) else 0.0,
+        "len_mean": float(arr.mean()) if len(arr) else 0.0,
+        "len_max": float(arr.max()) if len(arr) else 0.0,
+    }

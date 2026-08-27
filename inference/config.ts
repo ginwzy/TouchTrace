@@ -15,3 +15,10 @@ export const model_config = {
         [ModelType.LITE]: "model_lite.onnx"
     },
 };
+
+export const touch_model_config = {
+    modelPaths: {
+        [ModelType.STANDARD]: "touch.onnx",
+        [ModelType.LITE]: "touch_lite.onnx",
+    },
+};

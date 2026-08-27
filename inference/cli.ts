@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
-import { ModelType, move, steps } from './index.js';
+import { ModelType, move, steps, touchSteps } from './index.js';
 
 declare const __VERSION__: string;
 
@@ -23,10 +23,21 @@ program.command('move <x> <y> [model]')
     });
 
 program.command('steps <fromX> <fromY> <toX> <toY> [model]')
-    .description('Generate path with timestamps to go from one point to another.')
+    .description('Generate mouse path with timestamps to go from one point to another.')
     .action(async (fromX, fromY, toX, toY, model) => {
         const result = await steps({ x: +fromX, y: +fromY }, { x: +toX, y: +toY }, modelMap[model])
-        console.log(result)
+        console.log(JSON.stringify(result))
+    })
+
+program.command('touch-steps <fromX> <fromY> <toX> <toY> [model]')
+    .description('Generate touch swipe path with timestamps (JSON).')
+    .action(async (fromX, fromY, toX, toY, model) => {
+        const result = await touchSteps(
+            { x: +fromX, y: +fromY },
+            { x: +toX, y: +toY },
+            modelMap[model],
+        )
+        console.log(JSON.stringify(result))
     })
 
 await program.parseAsync(process.argv)

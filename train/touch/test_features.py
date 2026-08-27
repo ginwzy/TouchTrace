@@ -3,7 +3,18 @@
 from pathlib import Path
 import gzip
 
-from features import encode_trajectory, load_trajectory_jsonl, load_trajectory_sequences
+from features import encode_trajectory, load_trajectory_jsonl, load_trajectory_sequences, subsample_path
+
+
+def test_subsample_path_drops_micro_moves_keeps_endpoints():
+    path = [
+        {"x": 0.0, "y": 0.0, "timestamp": 0.0},
+        {"x": 1.0, "y": 0.0, "timestamp": 5.0},
+        {"x": 2.0, "y": 0.0, "timestamp": 10.0},
+        {"x": 20.0, "y": 0.0, "timestamp": 30.0},
+    ]
+    out = subsample_path(path, min_step_px=3.0)
+    assert [p["x"] for p in out] == [0.0, 20.0]
 
 
 def test_encode_trajectory_uses_previous_step_and_remaining_distance():

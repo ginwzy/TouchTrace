@@ -29,7 +29,12 @@ if str(HERE) not in sys.path:
 import numpy as np
 
 from config_touch import model_config
-from features import load_trajectory_jsonl, load_trajectory_sequences
+from features import (
+    compute_sample_weights,
+    load_trajectory_jsonl,
+    load_trajectory_sequences,
+    summarize_encoded_lengths,
+)
 
 LoaderMode = str  # "prepad" | "sequence"
 
@@ -67,18 +72,30 @@ def log_train_devices(loader_mode: LoaderMode) -> None:
     print(f"TensorFlow {tf.__version__} device={device} GPUs={gpus} loader={loader_mode}")
 
 
-def make_batch_sequence(xs, ys, batch_size: int, pad: float, shuffle: bool):
+def make_batch_sequence(
+    xs,
+    ys,
+    ws,
+    batch_size: int,
+    pad: float,
+    shuffle: bool,
+    noise_std: list[float] | None = None,
+    rng: np.random.Generator | None = None,
+):
     import tf_keras
 
     class TouchBatchSequence(tf_keras.utils.Sequence):
-        """Pads each batch to that batch's max length. Avoids tf.data + Metal hangs."""
+        """Pads each batch; optional input noise on (dx_prev, dy_prev, dt_prev)."""
 
         def __init__(self):
             self.xs = xs
             self.ys = ys
+            self.ws = ws
             self.batch_size = batch_size
             self.pad = pad
             self.shuffle = shuffle
+            self.noise_std = noise_std
+            self.rng = rng if rng is not None else np.random.default_rng()
             self.indices = np.arange(len(xs))
             self.on_epoch_end()
 
@@ -87,20 +104,41 @@ def make_batch_sequence(xs, ys, batch_size: int, pad: float, shuffle: bool):
 
         def on_epoch_end(self) -> None:
             if self.shuffle:
-                np.random.shuffle(self.indices)
+                self.rng.shuffle(self.indices)
 
         def __getitem__(self, idx: int):
             batch_idx = self.indices[idx * self.batch_size : (idx + 1) * self.batch_size]
             max_len = max(len(self.xs[i]) for i in batch_idx)
             x = np.full((len(batch_idx), max_len, self.xs[0].shape[-1]), self.pad, dtype=np.float32)
             y = np.full((len(batch_idx), max_len, self.ys[0].shape[-1]), self.pad, dtype=np.float32)
+            w = np.zeros((len(batch_idx), max_len), dtype=np.float32)
             for row, i in enumerate(batch_idx):
                 n = len(self.xs[i])
                 x[row, :n] = self.xs[i]
                 y[row, :n] = self.ys[i]
-            return x, y
+                w[row, :n] = self.ws[i]
+                if self.noise_std is not None:
+                    noise = self.rng.normal(0.0, self.noise_std, size=(n, 3)).astype(np.float32)
+                    x[row, :n, :3] += noise
+            return x, y, w
 
     return TouchBatchSequence()
+
+
+def make_prepad_sequence(
+    X: np.ndarray,
+    Y: np.ndarray,
+    W: np.ndarray,
+    batch_size: int,
+    pad: float,
+    shuffle: bool,
+    noise_std: list[float] | None = None,
+    rng: np.random.Generator | None = None,
+):
+    xs = [X[i] for i in range(len(X))]
+    ys = [Y[i] for i in range(len(Y))]
+    ws = [W[i] for i in range(len(W))]
+    return make_batch_sequence(xs, ys, ws, batch_size, pad, shuffle, noise_std, rng)
 
 
 def build_touch_model(lstm_units: int):
@@ -172,8 +210,10 @@ def train(
     data: Path | None = None,
     prepad: bool = False,
     sequence: bool = False,
+    min_step_px: float | None = None,
+    no_augment: bool = False,
 ) -> Path:
-    from tf_keras.callbacks import EarlyStopping, ModelCheckpoint
+    from tf_keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 
     loader_mode = _resolve_loader_mode(prepad, sequence)
     _configure_onednn(loader_mode)
@@ -185,9 +225,18 @@ def train(
     pad = model_config["pad"]
     batch_size = model_config["batch_size"]
     max_steps = model_config["max_steps"]
+    step_px = model_config["min_step_px"] if min_step_px is None else min_step_px
+    noise_std = None if no_augment else model_config["input_noise_std"]
+    rng = np.random.default_rng(42)
 
     log_train_devices(loader_mode)
-    print(f"Parsing data from {data_path} (max_steps={max_steps}) ...")
+    print(f"Parsing data from {data_path} (max_steps={max_steps}, min_step_px={step_px}) ...")
+    before = summarize_encoded_lengths(data_path, min_step_px=0.0)
+    after = summarize_encoded_lengths(data_path, min_step_px=step_px)
+    print(
+        f"Subsample {step_px}px: len mean {before['len_mean']:.1f} -> {after['len_mean']:.1f} "
+        f"({int(after['count'])} paths)"
+    )
 
     model = build_touch_model(units)
     model.summary()
@@ -207,6 +256,13 @@ def train(
             monitor="val_loss",
             verbose=1,
         ),
+        ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=model_config["reduce_lr_factor"],
+            patience=model_config["reduce_lr_patience"],
+            min_lr=model_config["min_lr"],
+            verbose=1,
+        ),
         EarlyStopping(
             monitor="val_loss",
             patience=model_config["early_stopping_patience"],
@@ -216,41 +272,55 @@ def train(
     ]
 
     if loader_mode == "prepad":
-        X, Y = load_trajectory_jsonl(data_path, pad=pad, max_steps=max_steps)
+        X, Y = load_trajectory_jsonl(data_path, pad=pad, max_steps=max_steps, min_step_px=step_px)
+        W = compute_sample_weights(
+            X,
+            Y,
+            pad,
+            model_config["loss_step_weight"],
+            model_config["loss_dist_weight"],
+        )
         valid_steps = np.sum(Y[:, :, 0] != pad, axis=1)
         print(
             f"Loaded {len(X)} paths (prepad). "
             f"len min/mean/max={valid_steps.min()}/{valid_steps.mean():.1f}/{valid_steps.max()}"
         )
         X_train, Y_train, X_val, Y_val = _split_arrays(X, Y, model_config["validation_split"])
-        print(f"train arrays {X_train.shape}, val arrays {X_val.shape}, batch_size={batch_size}")
-        model.fit(
-            X_train,
-            Y_train,
-            epochs=n_epochs,
-            batch_size=batch_size,
-            validation_data=(X_val, Y_val),
-            callbacks=callbacks,
-            shuffle=True,
+        W_train, W_val = _split_arrays(W, W, model_config["validation_split"])  # type: ignore[assignment]
+        train_seq = make_prepad_sequence(
+            X_train, Y_train, W_train, batch_size, pad, shuffle=True, noise_std=noise_std, rng=rng
         )
+        val_seq = make_prepad_sequence(
+            X_val, Y_val, W_val, batch_size, pad, shuffle=False, noise_std=None, rng=rng
+        )
+        xb, yb, wb = train_seq[0]
+        print(f"train batch {xb.shape}, sample_weight mean={wb[wb > 0].mean():.2f}, augment={noise_std is not None}")
+        model.fit(train_seq, epochs=n_epochs, validation_data=val_seq, callbacks=callbacks)
     else:
-        xs, ys = load_trajectory_sequences(data_path, max_steps=max_steps)
+        xs, ys = load_trajectory_sequences(data_path, max_steps=max_steps, min_step_px=step_px)
         lengths = [len(x) for x in xs]
         print(
             f"Loaded {len(xs)} paths (sequence). "
             f"len min/mean/max={min(lengths)}/{sum(lengths) / len(lengths):.1f}/{max(lengths)}"
         )
         x_train, y_train, x_val, y_val = _split_sequences(xs, ys, model_config["validation_split"])
-        train_seq = make_batch_sequence(x_train, y_train, batch_size, pad, shuffle=True)
-        val_seq = make_batch_sequence(x_val, y_val, batch_size, pad, shuffle=False)
-        xb, yb = train_seq[0]
-        print(f"example batch shape={xb.shape} (dynamic time dim, cap {max_steps})")
-        model.fit(
-            train_seq,
-            epochs=n_epochs,
-            validation_data=val_seq,
-            callbacks=callbacks,
-        )
+        w_train = [
+            compute_sample_weights(
+                x[np.newaxis], y[np.newaxis], pad, model_config["loss_step_weight"], model_config["loss_dist_weight"]
+            )[0]
+            for x, y in zip(x_train, y_train)
+        ]
+        w_val = [
+            compute_sample_weights(
+                x[np.newaxis], y[np.newaxis], pad, model_config["loss_step_weight"], model_config["loss_dist_weight"]
+            )[0]
+            for x, y in zip(x_val, y_val)
+        ]
+        train_seq = make_batch_sequence(x_train, y_train, w_train, batch_size, pad, True, noise_std, rng)
+        val_seq = make_batch_sequence(x_val, y_val, w_val, batch_size, pad, False, None, rng)
+        xb, yb, wb = train_seq[0]
+        print(f"example batch shape={xb.shape}, augment={noise_std is not None}")
+        model.fit(train_seq, epochs=n_epochs, validation_data=val_seq, callbacks=callbacks)
 
     out = HERE / weights_name
     model.save_weights(str(out))
@@ -274,6 +344,8 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Dynamic batch padding via Sequence (Mac Metal only if prepad hangs)",
     )
+    parser.add_argument("--min-step-px", type=float, default=None, help="Path subsample threshold (default from config)")
+    parser.add_argument("--no-augment", action="store_true", help="Disable input noise augmentation")
     args = parser.parse_args(argv)
     train(
         lite=args.lite,
@@ -281,6 +353,8 @@ def main(argv: list[str] | None = None) -> None:
         data=args.data,
         prepad=args.prepad,
         sequence=args.sequence,
+        min_step_px=args.min_step_px,
+        no_augment=args.no_augment,
     )
 
 

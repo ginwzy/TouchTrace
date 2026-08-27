@@ -1,5 +1,4 @@
 import ort from 'onnxruntime-node';
-import robot from 'robotjs';
 
 import { join } from 'path';
 
@@ -8,6 +7,7 @@ import { smoothPath, sampleFromMDN, sleep, paramsSize } from './util.ts';
 
 import { ModelType } from './config.ts';
 export { ModelType } from './config.ts';
+export { touchSteps } from './touch.ts';
 
 export interface Position {
     x: number;
@@ -111,6 +111,7 @@ export async function steps(start: Position, end: Position, type?: ModelType): P
 }
 
 export async function move(x: number, y: number, type?: ModelType) {
+    const robot = (await import('robotjs')).default;
     const session = await getSession(type);
     const start = robot.getMousePos();
 

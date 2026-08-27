@@ -1,0 +1,17 @@
+[project]
+name = "touchtrace-train"
+version = "0.1.0"
+description = "TouchTrace touch model training utilities"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10",
+    "onnxruntime>=1.20",
+    "pytest>=8.0",
+    "tensorflow>=2.20",
+    "tensorflow-probability>=0.25",
+    "tf-keras>=2.20",
+    "tf2onnx>=1.16",
+]
+
+[tool.uv]
+dev-dependencies = []

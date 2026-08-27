@@ -10,3 +10,5 @@ train/touch/touch_sensor_data.jsonl
 train/touch/train.log
 train/**/*.h5
 train/touch/*.onnx
+inference/public/touch.onnx
+inference/public/touch_lite.onnx

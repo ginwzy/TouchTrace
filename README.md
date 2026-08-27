@@ -119,13 +119,23 @@ python convert.py
 Touch model (`touch_data.jsonl.gz` is in the repo; weights are not — train locally or on Colab):
 
 ```bash
+# uv venv (project root)
+uv venv --python 3.12
+source .venv/bin/activate
+export http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890
+uv sync
+
 cd train/touch
 python -m pytest -q
-python train_touch.py          # prepad + batch 256 by default
+python train_touch.py          # subsample + weighted loss + input noise
 python convert_touch.py
+python eval_generate.py --model touch.onnx   # raw vs guided metrics
+python preview_swipes.py --model touch.onnx --raw
+cp touch.onnx ../../inference/public/touch.onnx   # for CLI inference
+python preview_swipes.py --model touch.onnx
 ```
 
-**Google Colab (GPU):** upload or open [`notebooks/train_touch_colab.ipynb`](notebooks/train_touch_colab.ipynb), set runtime to GPU, run all cells.
+**Google Colab (GPU):** open [`notebooks/train_touch_colab.ipynb`](notebooks/train_touch_colab.ipynb), set runtime to GPU, run all cells.
 
 ---
 
