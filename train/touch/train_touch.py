@@ -286,7 +286,8 @@ def train(
             f"len min/mean/max={valid_steps.min()}/{valid_steps.mean():.1f}/{valid_steps.max()}"
         )
         X_train, Y_train, X_val, Y_val = _split_arrays(X, Y, model_config["validation_split"])
-        W_train, W_val = _split_arrays(W, W, model_config["validation_split"])  # type: ignore[assignment]
+        train_idx, val_idx = _train_val_indices(len(X), model_config["validation_split"])
+        W_train, W_val = W[train_idx], W[val_idx]
         train_seq = make_prepad_sequence(
             X_train, Y_train, W_train, batch_size, pad, shuffle=True, noise_std=noise_std, rng=rng
         )
