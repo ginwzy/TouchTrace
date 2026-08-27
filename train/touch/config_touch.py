@@ -11,7 +11,7 @@ model_config = {
     "lstm_units_lite": 64,
     "learning_rate": 0.0005,
     "validation_split": 0.1,
-    "early_stopping_patience": 20,
+    "early_stopping_patience": 40,
     "weights": "model.h5",
     "weights_lite": "model_lite.h5",
     "onnx_model": "touch.onnx",
