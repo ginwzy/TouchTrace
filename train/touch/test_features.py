@@ -3,7 +3,10 @@
 from pathlib import Path
 import gzip
 
+import numpy as np
+
 from features import (
+    GEOM_TRANSFORMS,
     apply_geom_transform,
     angle_multipliers,
     encode_trajectory,
@@ -12,6 +15,7 @@ from features import (
     scale_sample_weights_by_angle,
     subsample_path,
     swipe_angle_bucket,
+    unpad_sequences,
 )
 
 
@@ -136,8 +140,6 @@ def test_angle_multipliers_upweight_rare_buckets():
 
 
 def test_scale_sample_weights_by_angle_broadcasts():
-    import numpy as np
-
     X = np.zeros((3, 3, 5), dtype=np.float32)
     X[0, 0, 3], X[0, 0, 4] = 0.0, 100.0  # V
     X[1, 0, 3], X[1, 0, 4] = 0.0, 100.0  # V
@@ -149,12 +151,43 @@ def test_scale_sample_weights_by_angle_broadcasts():
 
 
 def test_geom_transform_rot90_turns_vertical_into_horizontal():
-    import numpy as np
-
+    rot90 = GEOM_TRANSFORMS[1]
     x = np.array([[0.0, 10.0, 8.0, 0.0, 400.0]], dtype=np.float32)
     y = np.array([[0.0, 12.0, 8.0]], dtype=np.float32)
-    xr, yr = apply_geom_transform(x, y, lambda a, b: (-b, a))
+    xr, yr = apply_geom_transform(x, y, rot90)
     assert xr[0].tolist() == [-10.0, 0.0, 8.0, -400.0, 0.0]
     assert yr[0].tolist() == [-12.0, 0.0, 8.0]
     assert swipe_angle_bucket(float(xr[0, 3]), float(xr[0, 4])) == "H"
+
+
+def test_post_aug_angle_weight_boosts_remaining_diagonals():
+    rot90 = GEOM_TRANSFORMS[1]
+    x = np.zeros((4, 1, 5), dtype=np.float32)
+    y = np.zeros((4, 1, 3), dtype=np.float32)
+    x[:3, 0, 4] = 400.0
+    x[3, 0, 3] = 300.0
+    x[3, 0, 4] = 300.0
+    xr = np.stack([apply_geom_transform(x[i], y[i], rot90)[0] for i in range(4)])
+    out = scale_sample_weights_by_angle(np.ones((4, 1), dtype=np.float32), xr, max_mult=8.0)
+    assert swipe_angle_bucket(float(xr[0, 0, 3]), float(xr[0, 0, 4])) == "H"
+    assert swipe_angle_bucket(float(xr[3, 0, 3]), float(xr[3, 0, 4])) == "D"
+    assert out[3, 0] > out[0, 0]
+
+
+def test_unpad_strips_padded_timesteps():
+    pad = -999.0
+    X = np.full((2, 4, 5), pad, dtype=np.float32)
+    Y = np.full((2, 4, 3), pad, dtype=np.float32)
+    W = np.zeros((2, 4), dtype=np.float32)
+    X[0, :2] = 1.0
+    Y[0, :2] = 1.0
+    W[0, :2] = 1.0
+    X[1, :1] = 2.0
+    Y[1, :1] = 2.0
+    W[1, :1] = 1.0
+    xs, ys, ws = unpad_sequences(X, Y, W, pad)
+    assert [x.shape[0] for x in xs] == [2, 1]
+    assert [y.shape[0] for y in ys] == [2, 1]
+    assert [w.shape[0] for w in ws] == [2, 1]
+    assert float(ys[0].min()) != pad
 

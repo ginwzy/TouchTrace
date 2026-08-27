@@ -20,9 +20,12 @@ def export_onnx(lite: bool = False, weights: Path | None = None, output: Path | 
     import tf_keras as keras
 
     units = model_config["lstm_units_lite"] if lite else model_config["lstm_units"]
-    weights_path = Path(weights) if weights else HERE / (
-        model_config["weights_lite"] if lite else model_config["weights"]
-    )
+    if weights is not None:
+        weights_path = Path(weights)
+    else:
+        fallback = HERE / model_config["weights_lite" if lite else "weights"]
+        best = HERE / f"{fallback.stem}_best.h5"
+        weights_path = best if best.exists() else fallback
     out_path = Path(output) if output else HERE / (
         "touch_lite.onnx" if lite else model_config["onnx_model"]
     )

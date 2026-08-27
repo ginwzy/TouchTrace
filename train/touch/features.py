@@ -210,6 +210,24 @@ def _pad(sequences: list[list[list[float]]], pad: float) -> np.ndarray:
     return out
 
 
+def unpad_sequences(
+    X: np.ndarray,
+    Y: np.ndarray,
+    W: np.ndarray,
+    pad: float,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    """Drop padded timesteps so geom aug / noise cannot rotate the pad sentinel."""
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    ws: list[np.ndarray] = []
+    for i in range(len(X)):
+        n = int(np.sum(Y[i, :, 0] != pad))
+        xs.append(np.array(X[i, :n], dtype=np.float32, copy=True))
+        ys.append(np.array(Y[i, :n], dtype=np.float32, copy=True))
+        ws.append(np.array(W[i, :n], dtype=np.float32, copy=True))
+    return xs, ys, ws
+
+
 def summarize_encoded_lengths(filepath: str | Path, min_step_px: float = 0.0) -> dict[str, float]:
     lengths = [len(y) for _, y in iter_encoded_trajectories(filepath, min_step_px=min_step_px)]
     arr = np.array(lengths, dtype=np.float32)
