@@ -150,6 +150,24 @@ def test_scale_sample_weights_by_angle_broadcasts():
     assert out[2, 0] == out[2, 2]
 
 
+def test_geom_transforms_are_rotations_not_reflections():
+    assert len(GEOM_TRANSFORMS) == 4
+    for fn in GEOM_TRANSFORMS:
+        e1x, e1y = fn(1.0, 0.0)
+        e2x, e2y = fn(0.0, 1.0)
+        assert e1x * e2y - e1y * e2x == 1.0
+
+
+def test_geom_transforms_preserve_bow_side():
+    x = np.array([[5.0, 10.0, 8.0, 0.0, 400.0]], dtype=np.float32)
+    y = np.array([[8.0, 12.0, 8.0]], dtype=np.float32)
+    sign0 = np.sign(0.0 * 12.0 - 400.0 * 8.0)
+    for fn in GEOM_TRANSFORMS:
+        xr, yr = apply_geom_transform(x, y, fn)
+        sign = np.sign(float(xr[0, 3]) * float(yr[0, 1]) - float(xr[0, 4]) * float(yr[0, 0]))
+        assert sign == sign0
+
+
 def test_geom_transform_rot90_turns_vertical_into_horizontal():
     rot90 = GEOM_TRANSFORMS[1]
     x = np.array([[0.0, 10.0, 8.0, 0.0, 400.0]], dtype=np.float32)

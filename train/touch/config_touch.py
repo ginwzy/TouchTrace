@@ -13,12 +13,12 @@ model_config = {
     "loss_step_weight": 0.15,
     "loss_dist_weight": 0.002,
     # Inverse-frequency multiplier on whole swipes by angle bucket (H/D/V), clipped.
-    # With geom_aug, this is applied AFTER the D4 transform (V↔H swap); without it,
+    # With geom_aug, this is applied AFTER the C4 rotation (V↔H swap); without it,
     # it is applied to the original remaining-distance vector.
     "angle_h_deg": 20.0,
     "angle_v_deg": 60.0,
     "angle_weight_max": 8.0,
-    # Random D4 transform (rotations + reflections) on (dx, dy) each train sample.
+    # Random 90° rotations on (dx, dy). No reflections: those cancel one-sided bow.
     "geom_aug": True,
     # Cap per-timestep MDN NLL so a collapsed scale cannot NaN the run.
     "nll_clip": 80.0,

@@ -14,16 +14,13 @@ DEFAULT_MAX_STEPS = 128
 ANGLE_H_DEG = 20.0
 ANGLE_V_DEG = 60.0
 
-# D4: identity, 90/180/270 rotations, and four reflections.
+# C4 rotations only. Reflections would flip the dominant right-of-travel bow
+# (~90% of real V/D) and cancel it in the MDN mean.
 GEOM_TRANSFORMS = (
     lambda x, y: (x, y),
     lambda x, y: (-y, x),
     lambda x, y: (-x, -y),
     lambda x, y: (y, -x),
-    lambda x, y: (-x, y),
-    lambda x, y: (x, -y),
-    lambda x, y: (y, x),
-    lambda x, y: (-y, -x),
 )
 
 

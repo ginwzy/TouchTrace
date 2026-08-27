@@ -459,7 +459,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--min-step-px", type=float, default=None, help="Path subsample threshold (default from config)")
     parser.add_argument("--no-augment", action="store_true", help="Disable input noise augmentation")
-    parser.add_argument("--no-geom-aug", action="store_true", help="Disable rotation/reflection augmentation")
+    parser.add_argument("--no-geom-aug", action="store_true", help="Disable 90° rotation augmentation")
     parser.add_argument("--no-angle-weight", action="store_true", help="Disable H/D/V inverse-frequency weights")
     args = parser.parse_args(argv)
     train(
