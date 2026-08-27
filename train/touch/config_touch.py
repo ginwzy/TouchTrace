@@ -13,13 +13,14 @@ model_config = {
     "loss_step_weight": 0.15,
     "loss_dist_weight": 0.002,
     # Inverse-frequency multiplier on whole swipes by angle bucket (H/D/V), clipped.
-    # With geom_aug, this is applied AFTER the C4 rotation (V↔H swap); without it,
-    # it is applied to the original remaining-distance vector.
+    # Unused when remaining_frame is on (every swipe looks axis-aligned).
     "angle_h_deg": 20.0,
     "angle_v_deg": 60.0,
     "angle_weight_max": 8.0,
-    # Random 90° rotations on (dx, dy). No reflections: those cancel one-sided bow.
+    # Random 90° rotations on (dx, dy). Skipped when remaining_frame is on.
     "geom_aug": True,
+    # Encode/predict in remaining-aligned (tangent, normal) instead of screen dx/dy.
+    "remaining_frame": True,
     # Cap per-timestep MDN NLL so a collapsed scale cannot NaN the run.
     "nll_clip": 80.0,
     # Gradient clip: LSTM+MDN can spike even when the loss is still finite.

@@ -10,11 +10,13 @@ from features import (
     apply_geom_transform,
     angle_multipliers,
     encode_trajectory,
+    from_remaining_frame,
     load_trajectory_jsonl,
     load_trajectory_sequences,
     scale_sample_weights_by_angle,
     subsample_path,
     swipe_angle_bucket,
+    to_remaining_frame,
     unpad_sequences,
 )
 
@@ -38,7 +40,7 @@ def test_encode_trajectory_uses_previous_step_and_remaining_distance():
     ]
     target = {"x": 540.0, "y": 1200.0}
 
-    X, Y = encode_trajectory(path, target)
+    X, Y = encode_trajectory(path, target, remaining_frame=False)
 
     assert X == [
         [0.0, 0.0, 0.0, 440.0, 400.0],
@@ -48,6 +50,40 @@ def test_encode_trajectory_uses_previous_step_and_remaining_distance():
         [40.0, -40.0, 16.0],
         [400.0, 440.0, 84.0],
     ]
+
+
+def test_remaining_frame_maps_remaining_onto_plus_x():
+    tan, nrm, rem = to_remaining_frame(0.0, 12.0, 0.0, 400.0)
+    assert rem == 400.0
+    assert tan == 12.0
+    assert abs(nrm) < 1e-6
+    dx, dy = from_remaining_frame(tan, nrm, 0.0, 400.0)
+    assert (dx, dy) == (0.0, 12.0)
+
+
+def test_remaining_frame_roundtrip_diagonal():
+    tan, nrm, rem = to_remaining_frame(3.0, 4.0, 30.0, 40.0)
+    dx, dy = from_remaining_frame(tan, nrm, 30.0, 40.0)
+    assert rem == 50.0
+    assert abs(dx - 3.0) < 1e-6
+    assert abs(dy - 4.0) < 1e-6
+
+
+def test_remaining_frame_is_rotation_invariant():
+    path = [
+        {"x": 0.0, "y": 0.0, "timestamp": 0.0},
+        {"x": 0.0, "y": 10.0, "timestamp": 16.0},
+        {"x": 8.0, "y": 50.0, "timestamp": 80.0},
+    ]
+    target = {"x": 8.0, "y": 50.0}
+    X1, Y1 = encode_trajectory(path, target, remaining_frame=True)
+    path_r = [{"x": -p["y"], "y": p["x"], "timestamp": p["timestamp"]} for p in path]
+    target_r = {"x": -50.0, "y": 8.0}
+    X2, Y2 = encode_trajectory(path_r, target_r, remaining_frame=True)
+    np.testing.assert_allclose(X1, X2, atol=1e-5)
+    np.testing.assert_allclose(Y1, Y2, atol=1e-5)
+    assert X1[0][3] > 0
+    assert X1[0][4] == 0.0
 
 
 def test_load_jsonl_pads_shorter_paths_and_ignores_pressure(tmp_path: Path):
@@ -64,7 +100,7 @@ def test_load_jsonl_pads_shorter_paths_and_ignores_pressure(tmp_path: Path):
         "]}\n"
     )
 
-    X, Y = load_trajectory_jsonl(jsonl, pad=-999.0)
+    X, Y = load_trajectory_jsonl(jsonl, pad=-999.0, remaining_frame=False)
 
     assert X.shape == (2, 2, 5)
     assert Y.shape == (2, 2, 3)

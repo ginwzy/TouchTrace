@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from features import from_remaining_frame, to_remaining_frame
+
 if TYPE_CHECKING:
     import onnxruntime as ort
 
@@ -44,6 +46,7 @@ class GenerateOptions:
     smooth: bool = True
     smooth_window: int = 7
     seed: int | None = None
+    remaining_frame: bool = True
 
 
 def softplus(x: float) -> float:
@@ -161,10 +164,20 @@ def generate_touch_path(
         if dist < 3.0:
             break
 
-        sequence.append([dx_prev, dy_prev, dt_prev, end[0] - cx, end[1] - cy])
+        rem_x = end[0] - cx
+        rem_y = end[1] - cy
+        if opts.remaining_frame:
+            tan_prev, nrm_prev, rem = to_remaining_frame(dx_prev, dy_prev, rem_x, rem_y)
+            sequence.append([tan_prev, nrm_prev, dt_prev, rem, 0.0])
+        else:
+            sequence.append([dx_prev, dy_prev, dt_prev, rem_x, rem_y])
         arr = np.array(sequence, dtype=np.float32).reshape(1, len(sequence), INPUT_DIMS)
         params = session.run([output_name], {input_name: arr})[0][0, -1, :PARAMS_SIZE]
-        dx, dy, dt = sample_from_mdn(params, rng)
+        d0, d1, dt = sample_from_mdn(params, rng)
+        if opts.remaining_frame:
+            dx, dy = from_remaining_frame(d0, d1, rem_x, rem_y)
+        else:
+            dx, dy = d0, d1
         dt_step = dt if dt > 0 else MIN_DELAY_MS
 
         if opts.guided:

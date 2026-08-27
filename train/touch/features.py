@@ -1,4 +1,4 @@
-"""Encode swipe jsonl into (dx, dy, dt, remaining-distance) training sequences."""
+"""Encode swipe jsonl into (tan, nrm, dt, remaining-length) training sequences."""
 
 from __future__ import annotations
 
@@ -93,7 +93,35 @@ def subsample_path(path: list[dict], min_step_px: float = 0.0) -> list[dict]:
     return out
 
 
-def encode_trajectory(path: list[dict], target: dict) -> tuple[list[list[float]], list[list[float]]]:
+def remaining_frame_axes(rem_x: float, rem_y: float) -> tuple[float, float, float]:
+    """Cos/sin that maps remaining (rem_x, rem_y) onto (+length, 0)."""
+    rem = math.hypot(rem_x, rem_y)
+    if rem < 1e-6:
+        return 1.0, 0.0, rem
+    return rem_x / rem, rem_y / rem, rem
+
+
+def to_remaining_frame(
+    dx: float, dy: float, rem_x: float, rem_y: float
+) -> tuple[float, float, float]:
+    """Rotate a screen delta into (tangent, normal, remaining_length)."""
+    c, s, rem = remaining_frame_axes(rem_x, rem_y)
+    return c * dx + s * dy, -s * dx + c * dy, rem
+
+
+def from_remaining_frame(
+    tan: float, nrm: float, rem_x: float, rem_y: float
+) -> tuple[float, float]:
+    """Rotate a remaining-frame delta back to screen (dx, dy)."""
+    c, s, _rem = remaining_frame_axes(rem_x, rem_y)
+    return c * tan - s * nrm, s * tan + c * nrm
+
+
+def encode_trajectory(
+    path: list[dict],
+    target: dict,
+    remaining_frame: bool = True,
+) -> tuple[list[list[float]], list[list[float]]]:
     target_x = float(target["x"])
     target_y = float(target["y"])
     dx_prev = 0.0
@@ -110,8 +138,14 @@ def encode_trajectory(path: list[dict], target: dict) -> tuple[list[list[float]]
         dt_curr = float(curr["timestamp"]) - float(prev["timestamp"])
         dist_x = target_x - float(prev["x"])
         dist_y = target_y - float(prev["y"])
-        X.append([dx_prev, dy_prev, dt_prev, dist_x, dist_y])
-        Y.append([dx_curr, dy_curr, dt_curr])
+        if remaining_frame:
+            tan_prev, nrm_prev, rem = to_remaining_frame(dx_prev, dy_prev, dist_x, dist_y)
+            tan_curr, nrm_curr, _rem = to_remaining_frame(dx_curr, dy_curr, dist_x, dist_y)
+            X.append([tan_prev, nrm_prev, dt_prev, rem, 0.0])
+            Y.append([tan_curr, nrm_curr, dt_curr])
+        else:
+            X.append([dx_prev, dy_prev, dt_prev, dist_x, dist_y])
+            Y.append([dx_curr, dy_curr, dt_curr])
         dx_prev = dx_curr
         dy_prev = dy_curr
         dt_prev = dt_curr
@@ -145,6 +179,7 @@ def iter_encoded_trajectories(
     filepath: str | Path,
     max_steps: int | None = DEFAULT_MAX_STEPS,
     min_step_px: float = 0.0,
+    remaining_frame: bool = True,
 ) -> Iterator[tuple[list[list[float]], list[list[float]]]]:
     with _open_jsonl(filepath) as f:
         for line in f:
@@ -155,7 +190,7 @@ def iter_encoded_trajectories(
             path = subsample_path(data.get("path", []), min_step_px=min_step_px)
             if len(path) < 2:
                 continue
-            x_seq, y_seq = encode_trajectory(path, data["target"])
+            x_seq, y_seq = encode_trajectory(path, data["target"], remaining_frame=remaining_frame)
             if max_steps is not None:
                 x_seq = x_seq[:max_steps]
                 y_seq = y_seq[:max_steps]
@@ -168,11 +203,12 @@ def load_trajectory_sequences(
     filepath: str | Path,
     max_steps: int | None = DEFAULT_MAX_STEPS,
     min_step_px: float = 0.0,
+    remaining_frame: bool = True,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
     for x_seq, y_seq in iter_encoded_trajectories(
-        filepath, max_steps=max_steps, min_step_px=min_step_px
+        filepath, max_steps=max_steps, min_step_px=min_step_px, remaining_frame=remaining_frame
     ):
         xs.append(np.asarray(x_seq, dtype=np.float32))
         ys.append(np.asarray(y_seq, dtype=np.float32))
@@ -184,11 +220,12 @@ def load_trajectory_jsonl(
     pad: float = -999999.0,
     max_steps: int | None = DEFAULT_MAX_STEPS,
     min_step_px: float = 0.0,
+    remaining_frame: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     X_all: list[list[list[float]]] = []
     Y_all: list[list[list[float]]] = []
     for x_seq, y_seq in iter_encoded_trajectories(
-        filepath, max_steps=max_steps, min_step_px=min_step_px
+        filepath, max_steps=max_steps, min_step_px=min_step_px, remaining_frame=remaining_frame
     ):
         X_all.append(x_seq)
         Y_all.append(y_seq)

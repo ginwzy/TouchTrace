@@ -17,6 +17,31 @@ function getTouchSession(type?: ModelType) {
     return touchSessions[realType]!;
 }
 
+function toRemainingFrame(
+    dx: number,
+    dy: number,
+    remX: number,
+    remY: number,
+): { tan: number; nrm: number; rem: number } {
+    const rem = Math.hypot(remX, remY);
+    if (rem < 1e-6) {
+        return { tan: dx, nrm: dy, rem };
+    }
+    const c = remX / rem;
+    const s = remY / rem;
+    return { tan: c * dx + s * dy, nrm: -s * dx + c * dy, rem };
+}
+
+function fromRemainingFrame(tan: number, nrm: number, remX: number, remY: number): { dx: number; dy: number } {
+    const rem = Math.hypot(remX, remY);
+    if (rem < 1e-6) {
+        return { dx: tan, dy: nrm };
+    }
+    const c = remX / rem;
+    const s = remY / rem;
+    return { dx: c * tan - s * nrm, dy: s * tan + c * nrm };
+}
+
 interface GuidedOptions {
     maxSteps?: number;
     minStepPx?: number;
@@ -94,7 +119,10 @@ async function generateTouchPath(
         const dist = Math.hypot(end.x - currX, end.y - currY);
         if (dist < 3) break;
 
-        sequence.push([dxPrev, dyPrev, dtPrev, end.x - currX, end.y - currY]);
+        const remX = end.x - currX;
+        const remY = end.y - currY;
+        const prev = toRemainingFrame(dxPrev, dyPrev, remX, remY);
+        sequence.push([prev.tan, prev.nrm, dtPrev, prev.rem, 0]);
 
         const seqLen = sequence.length;
         const inputData = new Float32Array(seqLen * model_config.inputDims);
@@ -106,7 +134,9 @@ async function generateTouchPath(
         const results = await session.run({ [inputName]: tensor });
         const outputData = results[outputName].data as Float32Array;
         const lastStepParams = outputData.slice(outputData.length - paramsSize);
-        let { dx, dy, dt } = sampleFromMDN(lastStepParams);
+        const sampled = sampleFromMDN(lastStepParams);
+        let { dx, dy } = fromRemainingFrame(sampled.dx, sampled.dy, remX, remY);
+        const dt = sampled.dt;
         const dtStep = dt > 0 ? dt : model_config.minDelayMs;
 
         const guided = applyGuidedStep(currX, currY, end, dx, dy, minStepPx, maxStepPx, snapPx);

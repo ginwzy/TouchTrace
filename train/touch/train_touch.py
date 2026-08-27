@@ -10,7 +10,7 @@ Use --sequence only if training hangs on Mac Metal.
     python train_touch.py --lite
     python train_touch.py --epochs 1
     python train_touch.py --sequence   # Mac Metal fallback only
-    python train_touch.py --no-geom-aug --no-angle-weight  # previous recipe
+    python train_touch.py --screen-frame  # old screen-axis dx/dy recipe
 """
 
 from __future__ import annotations
@@ -272,11 +272,12 @@ def _scale_seq_weights(xs, ws, max_mult: float):
     return [w * m for w, m in zip(ws, mult)]
 
 
-def _log_first_batch(seq, noise_std, geom_aug: bool, angle_mode: str) -> None:
+def _log_first_batch(seq, noise_std, geom_aug: bool, angle_mode: str, remaining_frame: bool) -> None:
     xb, _, wb = seq[0]
     print(
         f"train batch {xb.shape}, sample_weight mean={wb[wb > 0].mean():.2f}, "
-        f"augment={noise_std is not None} geom_aug={geom_aug} angle_weight={angle_mode}"
+        f"augment={noise_std is not None} geom_aug={geom_aug} angle_weight={angle_mode} "
+        f"remaining_frame={remaining_frame}"
     )
 
 
@@ -290,6 +291,7 @@ def train(
     no_augment: bool = False,
     no_geom_aug: bool = False,
     no_angle_weight: bool = False,
+    screen_frame: bool = False,
 ) -> Path:
     from tf_keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, TerminateOnNaN
 
@@ -306,13 +308,24 @@ def train(
     max_steps = model_config["max_steps"]
     step_px = model_config["min_step_px"] if min_step_px is None else min_step_px
     noise_std = None if no_augment else model_config["input_noise_std"]
+    remaining_frame = bool(model_config.get("remaining_frame", True)) and not screen_frame
     geom_aug = bool(model_config["geom_aug"]) and not no_geom_aug
     angle_weight = not no_angle_weight
+    if remaining_frame:
+        if geom_aug:
+            print("remaining_frame=on: skipping geom_aug (directions already aligned)")
+            geom_aug = False
+        if angle_weight:
+            print("remaining_frame=on: skipping angle_weight (remaining is always on-axis)")
+            angle_weight = False
     in_batch, max_mult, angle_mode = _angle_weight_plan(angle_weight, geom_aug)
     rng = np.random.default_rng(42)
 
     log_train_devices(loader_mode)
-    print(f"Parsing data from {data_path} (max_steps={max_steps}, min_step_px={step_px}) ...")
+    print(
+        f"Parsing data from {data_path} (max_steps={max_steps}, min_step_px={step_px}, "
+        f"remaining_frame={remaining_frame}) ..."
+    )
     before = summarize_encoded_lengths(data_path, min_step_px=0.0)
     after = summarize_encoded_lengths(data_path, min_step_px=step_px)
     print(
@@ -354,7 +367,13 @@ def train(
     ]
 
     if loader_mode == "prepad":
-        X, Y = load_trajectory_jsonl(data_path, pad=pad, max_steps=max_steps, min_step_px=step_px)
+        X, Y = load_trajectory_jsonl(
+            data_path,
+            pad=pad,
+            max_steps=max_steps,
+            min_step_px=step_px,
+            remaining_frame=remaining_frame,
+        )
         W = compute_sample_weights(
             X,
             Y,
@@ -370,7 +389,7 @@ def train(
         X_train, Y_train, X_val, Y_val = _split_arrays(X, Y, model_config["validation_split"])
         train_idx, val_idx = _train_val_indices(len(X), model_config["validation_split"])
         W_train, W_val = W[train_idx], W[val_idx]
-        print(_angle_mix_line(_padded_angle_buckets(X_train), "train"))
+        print(_angle_mix_line(_padded_angle_buckets(X_train), "train") if not remaining_frame else "Angle mix train: remaining-frame (direction-invariant)")
         if angle_weight and not geom_aug:
             W_train = scale_sample_weights_by_angle(W_train, X_train, max_mult)
         if angle_weight:
@@ -391,10 +410,12 @@ def train(
         val_seq = make_prepad_sequence(
             X_val, Y_val, W_val, batch_size, pad, shuffle=False, noise_std=None, rng=rng
         )
-        _log_first_batch(train_seq, noise_std, geom_aug, angle_mode)
+        _log_first_batch(train_seq, noise_std, geom_aug, angle_mode, remaining_frame)
         model.fit(train_seq, epochs=n_epochs, validation_data=val_seq, callbacks=callbacks)
     else:
-        xs, ys = load_trajectory_sequences(data_path, max_steps=max_steps, min_step_px=step_px)
+        xs, ys = load_trajectory_sequences(
+            data_path, max_steps=max_steps, min_step_px=step_px, remaining_frame=remaining_frame
+        )
         lengths = [len(x) for x in xs]
         print(
             f"Loaded {len(xs)} paths (sequence). "
@@ -413,7 +434,7 @@ def train(
             )[0]
             for x, y in zip(x_val, y_val)
         ]
-        print(_angle_mix_line(_seq_angle_buckets(x_train), "train"))
+        print(_angle_mix_line(_seq_angle_buckets(x_train), "train") if not remaining_frame else "Angle mix train: remaining-frame (direction-invariant)")
         if angle_weight and not geom_aug:
             w_train = _scale_seq_weights(x_train, w_train, max_mult)
         if angle_weight:
@@ -432,7 +453,7 @@ def train(
             max_mult,
         )
         val_seq = make_batch_sequence(x_val, y_val, w_val, batch_size, pad, False, None, rng)
-        _log_first_batch(train_seq, noise_std, geom_aug, angle_mode)
+        _log_first_batch(train_seq, noise_std, geom_aug, angle_mode, remaining_frame)
         model.fit(train_seq, epochs=n_epochs, validation_data=val_seq, callbacks=callbacks)
 
     out = HERE / weights_name
@@ -461,6 +482,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--no-augment", action="store_true", help="Disable input noise augmentation")
     parser.add_argument("--no-geom-aug", action="store_true", help="Disable 90° rotation augmentation")
     parser.add_argument("--no-angle-weight", action="store_true", help="Disable H/D/V inverse-frequency weights")
+    parser.add_argument(
+        "--screen-frame",
+        action="store_true",
+        help="Encode dx/dy in screen axes (old recipe; remaining-frame is the default)",
+    )
     args = parser.parse_args(argv)
     train(
         lite=args.lite,
@@ -472,6 +498,7 @@ def main(argv: list[str] | None = None) -> None:
         no_augment=args.no_augment,
         no_geom_aug=args.no_geom_aug,
         no_angle_weight=args.no_angle_weight,
+        screen_frame=args.screen_frame,
     )
 
 
