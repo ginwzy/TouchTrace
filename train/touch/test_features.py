@@ -3,7 +3,16 @@
 from pathlib import Path
 import gzip
 
-from features import encode_trajectory, load_trajectory_jsonl, load_trajectory_sequences, subsample_path
+from features import (
+    apply_geom_transform,
+    angle_multipliers,
+    encode_trajectory,
+    load_trajectory_jsonl,
+    load_trajectory_sequences,
+    scale_sample_weights_by_angle,
+    subsample_path,
+    swipe_angle_bucket,
+)
 
 
 def test_subsample_path_drops_micro_moves_keeps_endpoints():
@@ -111,3 +120,41 @@ def test_load_gzipped_jsonl(tmp_path: Path):
 
     assert X.shape == (1, 1, 5)
     assert Y[0, 0].tolist() == [3.0, 0.0, 20.0]
+
+
+def test_swipe_angle_bucket_splits_h_d_v():
+    assert swipe_angle_bucket(400, 0) == "H"
+    assert swipe_angle_bucket(0, 400) == "V"
+    assert swipe_angle_bucket(300, 300) == "D"
+
+
+def test_angle_multipliers_upweight_rare_buckets():
+    buckets = ["V"] * 90 + ["D"] * 9 + ["H"]
+    w = angle_multipliers(buckets, max_mult=8.0)
+    assert w[0] < w[-2] < w[-1]
+    assert w[-1] == 8.0
+
+
+def test_scale_sample_weights_by_angle_broadcasts():
+    import numpy as np
+
+    X = np.zeros((3, 3, 5), dtype=np.float32)
+    X[0, 0, 3], X[0, 0, 4] = 0.0, 100.0  # V
+    X[1, 0, 3], X[1, 0, 4] = 0.0, 100.0  # V
+    X[2, 0, 3], X[2, 0, 4] = 100.0, 0.0  # H
+    W = np.ones((3, 3), dtype=np.float32)
+    out = scale_sample_weights_by_angle(W, X, max_mult=8.0)
+    assert out[2, 0] > out[0, 0]
+    assert out[2, 0] == out[2, 2]
+
+
+def test_geom_transform_rot90_turns_vertical_into_horizontal():
+    import numpy as np
+
+    x = np.array([[0.0, 10.0, 8.0, 0.0, 400.0]], dtype=np.float32)
+    y = np.array([[0.0, 12.0, 8.0]], dtype=np.float32)
+    xr, yr = apply_geom_transform(x, y, lambda a, b: (-b, a))
+    assert xr[0].tolist() == [-10.0, 0.0, 8.0, -400.0, 0.0]
+    assert yr[0].tolist() == [-12.0, 0.0, 8.0]
+    assert swipe_angle_bucket(float(xr[0, 3]), float(xr[0, 4])) == "H"
+

@@ -11,6 +11,68 @@ from pathlib import Path
 import numpy as np
 
 DEFAULT_MAX_STEPS = 128
+ANGLE_H_DEG = 20.0
+ANGLE_V_DEG = 60.0
+
+# D4: identity, 90/180/270 rotations, and four reflections.
+GEOM_TRANSFORMS = (
+    lambda x, y: (x, y),
+    lambda x, y: (-y, x),
+    lambda x, y: (-x, -y),
+    lambda x, y: (y, -x),
+    lambda x, y: (-x, y),
+    lambda x, y: (x, -y),
+    lambda x, y: (y, x),
+    lambda x, y: (-y, -x),
+)
+
+
+def swipe_angle_bucket(
+    dx: float,
+    dy: float,
+    h_deg: float = ANGLE_H_DEG,
+    v_deg: float = ANGLE_V_DEG,
+) -> str:
+    """Classify a swipe as H / D / V from its remaining-distance vector."""
+    ang = math.degrees(math.atan2(abs(dy), abs(dx)))
+    if ang < h_deg:
+        return "H"
+    if ang > v_deg:
+        return "V"
+    return "D"
+
+
+def angle_multipliers(buckets: list[str], max_mult: float = 8.0) -> np.ndarray:
+    """Inverse-frequency weights so H/D/V contribute equally, clipped at max_mult."""
+    if not buckets:
+        return np.zeros(0, dtype=np.float32)
+    counts: dict[str, int] = {}
+    for b in buckets:
+        counts[b] = counts.get(b, 0) + 1
+    n = len(buckets)
+    n_classes = max(len(counts), 1)
+    out = np.empty(n, dtype=np.float32)
+    for i, b in enumerate(buckets):
+        out[i] = min(max_mult, n / (n_classes * counts[b]))
+    return out
+
+
+def scale_sample_weights_by_angle(W: np.ndarray, X: np.ndarray, max_mult: float = 8.0) -> np.ndarray:
+    buckets = [swipe_angle_bucket(float(X[i, 0, 3]), float(X[i, 0, 4])) for i in range(len(X))]
+    return (W * angle_multipliers(buckets, max_mult)[:, None]).astype(np.float32)
+
+
+def apply_geom_transform(x: np.ndarray, y: np.ndarray, fn) -> tuple[np.ndarray, np.ndarray]:
+    """Apply a 2D linear map to spatial channels of one encoded sequence."""
+    x = np.array(x, dtype=np.float32, copy=True)
+    y = np.array(y, dtype=np.float32, copy=True)
+    dx, dy = x[..., 0].copy(), x[..., 1].copy()
+    x[..., 0], x[..., 1] = fn(dx, dy)
+    rx, ry = x[..., 3].copy(), x[..., 4].copy()
+    x[..., 3], x[..., 4] = fn(rx, ry)
+    ox, oy = y[..., 0].copy(), y[..., 1].copy()
+    y[..., 0], y[..., 1] = fn(ox, oy)
+    return x, y
 
 
 def subsample_path(path: list[dict], min_step_px: float = 0.0) -> list[dict]:

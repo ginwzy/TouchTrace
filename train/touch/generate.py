@@ -40,6 +40,7 @@ class GenerateOptions:
     snap_px: float = DEFAULT_SNAP_PX
     avg_step_px: float = DEFAULT_AVG_STEP_PX
     guided: bool = True
+    no_backtrack: bool = False
     smooth: bool = True
     smooth_window: int = 7
     seed: int | None = None
@@ -111,6 +112,27 @@ def _guided_step(
     return dx, dy, False
 
 
+def _no_backtrack_step(
+    cx: float,
+    cy: float,
+    end: tuple[float, float],
+    dx: float,
+    dy: float,
+    min_step_px: float,
+) -> tuple[float, float]:
+    """If the sampled step points away from the target, redirect it along the remaining vector."""
+    rem_x = end[0] - cx
+    rem_y = end[1] - cy
+    dist = math.hypot(rem_x, rem_y)
+    if dist < 1.0:
+        return dx, dy
+    tx, ty = rem_x / dist, rem_y / dist
+    if dx * tx + dy * ty >= 0:
+        return dx, dy
+    mag = max(math.hypot(dx, dy), min_step_px)
+    return tx * mag, ty * mag
+
+
 def generate_touch_path(
     session: ort.InferenceSession,
     start: tuple[float, float],
@@ -161,8 +183,8 @@ def generate_touch_path(
                 elapsed_ms += max(dt_step, MIN_DELAY_MS)
                 path.append(TouchStep(x=round(cx), y=round(cy), t=elapsed_ms))
                 break
-        else:
-            snapped = False
+        elif opts.no_backtrack:
+            dx, dy = _no_backtrack_step(cx, cy, end, dx, dy, opts.min_step_px)
 
         cx += dx
         cy += dy

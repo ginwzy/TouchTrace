@@ -10,6 +10,7 @@ Use --sequence only if training hangs on Mac Metal.
     python train_touch.py --lite
     python train_touch.py --epochs 1
     python train_touch.py --sequence   # Mac Metal fallback only
+    python train_touch.py --no-geom-aug --no-angle-weight  # previous recipe
 """
 
 from __future__ import annotations
@@ -30,10 +31,13 @@ import numpy as np
 
 from config_touch import model_config
 from features import (
+    angle_multipliers,
     compute_sample_weights,
     load_trajectory_jsonl,
     load_trajectory_sequences,
+    scale_sample_weights_by_angle,
     summarize_encoded_lengths,
+    swipe_angle_bucket,
 )
 
 LoaderMode = str  # "prepad" | "sequence"
@@ -81,8 +85,11 @@ def make_batch_sequence(
     shuffle: bool,
     noise_std: list[float] | None = None,
     rng: np.random.Generator | None = None,
+    geom_aug: bool = False,
 ):
     import tf_keras
+
+    from features import GEOM_TRANSFORMS, apply_geom_transform
 
     class TouchBatchSequence(tf_keras.utils.Sequence):
         """Pads each batch; optional input noise on (dx_prev, dy_prev, dt_prev)."""
@@ -95,6 +102,7 @@ def make_batch_sequence(
             self.pad = pad
             self.shuffle = shuffle
             self.noise_std = noise_std
+            self.geom_aug = geom_aug
             self.rng = rng if rng is not None else np.random.default_rng()
             self.indices = np.arange(len(xs))
             self.on_epoch_end()
@@ -114,8 +122,13 @@ def make_batch_sequence(
             w = np.zeros((len(batch_idx), max_len), dtype=np.float32)
             for row, i in enumerate(batch_idx):
                 n = len(self.xs[i])
-                x[row, :n] = self.xs[i]
-                y[row, :n] = self.ys[i]
+                xi = self.xs[i]
+                yi = self.ys[i]
+                if self.geom_aug:
+                    fn = GEOM_TRANSFORMS[int(self.rng.integers(len(GEOM_TRANSFORMS)))]
+                    xi, yi = apply_geom_transform(xi, yi, fn)
+                x[row, :n] = xi
+                y[row, :n] = yi
                 w[row, :n] = self.ws[i]
                 if self.noise_std is not None:
                     noise = self.rng.normal(0.0, self.noise_std, size=(n, 3)).astype(np.float32)
@@ -134,11 +147,12 @@ def make_prepad_sequence(
     shuffle: bool,
     noise_std: list[float] | None = None,
     rng: np.random.Generator | None = None,
+    geom_aug: bool = False,
 ):
     xs = [X[i] for i in range(len(X))]
     ys = [Y[i] for i in range(len(Y))]
     ws = [W[i] for i in range(len(W))]
-    return make_batch_sequence(xs, ys, ws, batch_size, pad, shuffle, noise_std, rng)
+    return make_batch_sequence(xs, ys, ws, batch_size, pad, shuffle, noise_std, rng, geom_aug)
 
 
 def build_touch_model(lstm_units: int):
@@ -204,6 +218,24 @@ def _resolve_data_path() -> Path:
     return gz
 
 
+def _angle_mix_line(items, label: str) -> str:
+    from collections import Counter
+
+    counts = Counter(items)
+    return (
+        f"Angle mix {label}: "
+        f"H={counts.get('H', 0)} D={counts.get('D', 0)} V={counts.get('V', 0)}"
+    )
+
+
+def _padded_angle_buckets(X: np.ndarray) -> list[str]:
+    return [swipe_angle_bucket(float(X[i, 0, 3]), float(X[i, 0, 4])) for i in range(len(X))]
+
+
+def _seq_angle_buckets(xs) -> list[str]:
+    return [swipe_angle_bucket(float(x[0, 3]), float(x[0, 4])) for x in xs]
+
+
 def train(
     lite: bool = False,
     epochs: int | None = None,
@@ -212,6 +244,8 @@ def train(
     sequence: bool = False,
     min_step_px: float | None = None,
     no_augment: bool = False,
+    no_geom_aug: bool = False,
+    no_angle_weight: bool = False,
 ) -> Path:
     from tf_keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 
@@ -227,6 +261,8 @@ def train(
     max_steps = model_config["max_steps"]
     step_px = model_config["min_step_px"] if min_step_px is None else min_step_px
     noise_std = None if no_augment else model_config["input_noise_std"]
+    geom_aug = bool(model_config["geom_aug"]) and not no_geom_aug
+    angle_weight = not no_angle_weight
     rng = np.random.default_rng(42)
 
     log_train_devices(loader_mode)
@@ -288,14 +324,30 @@ def train(
         X_train, Y_train, X_val, Y_val = _split_arrays(X, Y, model_config["validation_split"])
         train_idx, val_idx = _train_val_indices(len(X), model_config["validation_split"])
         W_train, W_val = W[train_idx], W[val_idx]
+        print(_angle_mix_line(_padded_angle_buckets(X_train), "train"))
+        if angle_weight:
+            max_mult = float(model_config["angle_weight_max"])
+            W_train = scale_sample_weights_by_angle(W_train, X_train, max_mult)
+            W_val = scale_sample_weights_by_angle(W_val, X_val, max_mult)
         train_seq = make_prepad_sequence(
-            X_train, Y_train, W_train, batch_size, pad, shuffle=True, noise_std=noise_std, rng=rng
+            X_train,
+            Y_train,
+            W_train,
+            batch_size,
+            pad,
+            shuffle=True,
+            noise_std=noise_std,
+            rng=rng,
+            geom_aug=geom_aug,
         )
         val_seq = make_prepad_sequence(
             X_val, Y_val, W_val, batch_size, pad, shuffle=False, noise_std=None, rng=rng
         )
         xb, yb, wb = train_seq[0]
-        print(f"train batch {xb.shape}, sample_weight mean={wb[wb > 0].mean():.2f}, augment={noise_std is not None}")
+        print(
+            f"train batch {xb.shape}, sample_weight mean={wb[wb > 0].mean():.2f}, "
+            f"augment={noise_std is not None} geom_aug={geom_aug} angle_weight={angle_weight}"
+        )
         model.fit(train_seq, epochs=n_epochs, validation_data=val_seq, callbacks=callbacks)
     else:
         xs, ys = load_trajectory_sequences(data_path, max_steps=max_steps, min_step_px=step_px)
@@ -317,10 +369,22 @@ def train(
             )[0]
             for x, y in zip(x_val, y_val)
         ]
-        train_seq = make_batch_sequence(x_train, y_train, w_train, batch_size, pad, True, noise_std, rng)
+        print(_angle_mix_line(_seq_angle_buckets(x_train), "train"))
+        if angle_weight:
+            max_mult = float(model_config["angle_weight_max"])
+            train_mult = angle_multipliers(_seq_angle_buckets(x_train), max_mult)
+            val_mult = angle_multipliers(_seq_angle_buckets(x_val), max_mult)
+            w_train = [w * m for w, m in zip(w_train, train_mult)]
+            w_val = [w * m for w, m in zip(w_val, val_mult)]
+        train_seq = make_batch_sequence(
+            x_train, y_train, w_train, batch_size, pad, True, noise_std, rng, geom_aug
+        )
         val_seq = make_batch_sequence(x_val, y_val, w_val, batch_size, pad, False, None, rng)
         xb, yb, wb = train_seq[0]
-        print(f"example batch shape={xb.shape}, augment={noise_std is not None}")
+        print(
+            f"example batch shape={xb.shape}, augment={noise_std is not None} "
+            f"geom_aug={geom_aug} angle_weight={angle_weight}"
+        )
         model.fit(train_seq, epochs=n_epochs, validation_data=val_seq, callbacks=callbacks)
 
     out = HERE / weights_name
@@ -347,6 +411,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--min-step-px", type=float, default=None, help="Path subsample threshold (default from config)")
     parser.add_argument("--no-augment", action="store_true", help="Disable input noise augmentation")
+    parser.add_argument("--no-geom-aug", action="store_true", help="Disable rotation/reflection augmentation")
+    parser.add_argument("--no-angle-weight", action="store_true", help="Disable H/D/V inverse-frequency weights")
     args = parser.parse_args(argv)
     train(
         lite=args.lite,
@@ -356,6 +422,8 @@ def main(argv: list[str] | None = None) -> None:
         sequence=args.sequence,
         min_step_px=args.min_step_px,
         no_augment=args.no_augment,
+        no_geom_aug=args.no_geom_aug,
+        no_angle_weight=args.no_angle_weight,
     )
 
 

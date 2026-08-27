@@ -12,6 +12,12 @@ model_config = {
     # sample_weight = 1 + step_weight * |step| + dist_weight * |remaining_dist|
     "loss_step_weight": 0.15,
     "loss_dist_weight": 0.002,
+    # Inverse-frequency multiplier on whole swipes by angle bucket (H/D/V), clipped.
+    "angle_h_deg": 20.0,
+    "angle_v_deg": 60.0,
+    "angle_weight_max": 8.0,
+    # Random D4 transform (rotations + reflections) on (dx, dy) each train sample.
+    "geom_aug": True,
     "epochs": 250,
     "batch_size": 256,
     "lstm_units": 128,

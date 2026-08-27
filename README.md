@@ -127,12 +127,12 @@ uv sync
 
 cd train/touch
 python -m pytest -q
-python train_touch.py          # subsample + weighted loss + input noise
+python train_touch.py          # subsample + weighted loss + geom aug + angle weights
 python convert_touch.py
-python eval_generate.py --model touch.onnx   # raw vs guided metrics
-python preview_swipes.py --model touch.onnx --raw
-cp touch.onnx ../../inference/public/touch.onnx   # for CLI inference
-python preview_swipes.py --model touch.onnx
+python eval_generate.py --model touch.onnx   # raw / no-backtrack / guided, by angle
+python preview_swipes.py --model touch.onnx --from-data --raw
+python preview_swipes.py --model touch.onnx --from-data --noback
+python preview_swipes.py --model touch.onnx --from-data
 ```
 
 **Google Colab (GPU):** open [`notebooks/train_touch_colab.ipynb`](notebooks/train_touch_colab.ipynb), set runtime to GPU, run all cells.

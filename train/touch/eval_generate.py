@@ -1,4 +1,4 @@
-"""Evaluate raw (no guided) touch generation against validation swipes."""
+"""Evaluate touch.onnx generation quality, split by swipe angle."""
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from config_touch import model_config
-from generate import GenerateOptions, generate_touch_path, load_session
+from features import swipe_angle_bucket
+from generate import GenerateOptions, TouchStep, generate_touch_path, load_session
 
 
 def _open_jsonl(path: Path):
@@ -44,48 +45,73 @@ def _load_val_swipes(data_path: Path, val_fraction: float, seed: int = 42, limit
             continue
         start = (float(path[0]["x"]), float(path[0]["y"]))
         end = (float(row["target"]["x"]), float(row["target"]["y"]))
-        swipes.append((start, end, len(path), path[-1]["timestamp"] - path[0]["timestamp"]))
+        swipes.append((start, end, path))
     return swipes
+
+
+def _perp_median(path: list[TouchStep], start: tuple[float, float], end: tuple[float, float]) -> float:
+    sx, sy = start
+    ex, ey = end
+    length = math.hypot(ex - sx, ey - sy) or 1.0
+    tx, ty = (ex - sx) / length, (ey - sy) / length
+    pts = path[:-1] if len(path) > 1 else path
+    perps = [abs((p.x - sx) * (-ty) + (p.y - sy) * tx) for p in pts[1:]]
+    return float(np.median(perps)) if perps else 0.0
+
+
+def _summarize(rows: list[tuple[int, float, float, bool]]) -> dict:
+    if not rows:
+        return {"n": 0, "steps_median": 0.0, "ms_median": 0.0, "perp_median": 0.0, "reach_rate": 0.0}
+    return {
+        "n": len(rows),
+        "steps_median": float(np.median([r[0] for r in rows])),
+        "ms_median": float(np.median([r[1] for r in rows])),
+        "perp_median": float(np.median([r[2] for r in rows])),
+        "reach_rate": sum(1 for r in rows if r[3]) / len(rows),
+    }
 
 
 def evaluate(model_path: Path, data_path: Path, limit: int | None = 200, seed: int = 42) -> dict:
     session = load_session(model_path)
     swipes = _load_val_swipes(data_path, model_config["validation_split"], seed=seed, limit=limit)
-    raw_opts = GenerateOptions(guided=False, smooth=False, seed=seed)
-    guided_opts = GenerateOptions(guided=True, smooth=True, seed=seed)
-
-    raw_steps, guided_steps = [], []
-    raw_ms, guided_ms = [], []
-    raw_ok = guided_ok = 0
-
-    for i, (start, end, real_len, real_ms) in enumerate(swipes):
-        rng = np.random.default_rng(seed + i)
-        raw = generate_touch_path(session, start, end, raw_opts, rng)
-        guided = generate_touch_path(session, start, end, guided_opts, rng)
-
-        raw_steps.append(len(raw))
-        guided_steps.append(len(guided))
-        raw_ms.append(raw[-1].t)
-        guided_ms.append(guided[-1].t)
-
-        for path in (raw, guided):
-            last = path[-2] if len(path) > 1 else path[-1]
-            err = math.hypot(end[0] - last.x, end[1] - last.y)
-            if path is raw and err < 3:
-                raw_ok += 1
-            if path is guided and err < 3:
-                guided_ok += 1
-
-    n = len(swipes)
-    return {
-        "n": n,
-        "raw_steps_median": float(np.median(raw_steps)),
-        "guided_steps_median": float(np.median(guided_steps)),
-        "raw_ms_median": float(np.median(raw_ms)),
-        "guided_ms_median": float(np.median(guided_ms)),
-        "raw_reach_rate": raw_ok / n,
-        "guided_reach_rate": guided_ok / n,
+    modes = {
+        "raw": GenerateOptions(guided=False, smooth=False, no_backtrack=False, seed=seed),
+        "noback": GenerateOptions(guided=False, smooth=False, no_backtrack=True, seed=seed),
+        "guided": GenerateOptions(guided=True, smooth=True, seed=seed),
     }
+
+    buckets = {name: {"H": [], "D": [], "V": [], "all": []} for name in modes}
+
+    for i, (start, end, _path) in enumerate(swipes):
+        angle = swipe_angle_bucket(end[0] - start[0], end[1] - start[1])
+        for name, opts in modes.items():
+            rng = np.random.default_rng(seed + i)
+            gen = generate_touch_path(session, start, end, opts, rng)
+            last = gen[-2] if len(gen) > 1 else gen[-1]
+            err = math.hypot(end[0] - last.x, end[1] - last.y)
+            row = (len(gen), float(gen[-1].t), _perp_median(gen, start, end), err < 3.0)
+            buckets[name]["all"].append(row)
+            buckets[name][angle].append(row)
+
+    return {name: {key: _summarize(rows) for key, rows in by_angle.items()} for name, by_angle in buckets.items()}
+
+
+def _print_mode(name: str, stats: dict) -> None:
+    overall = stats["all"]
+    print(
+        f"  {name:7} median steps={overall['steps_median']:.0f}  "
+        f"duration={overall['ms_median']:.0f}ms  "
+        f"reach={overall['reach_rate']*100:.0f}%  "
+        f"perp={overall['perp_median']:.0f}px"
+    )
+    for key in ("H", "D", "V"):
+        s = stats[key]
+        if s["n"] == 0:
+            continue
+        print(
+            f"          {key} n={s['n']:<4}  reach={s['reach_rate']*100:.0f}%  "
+            f"steps={s['steps_median']:.0f}  perp={s['perp_median']:.0f}px"
+        )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -101,9 +127,9 @@ def main(argv: list[str] | None = None) -> None:
         data = gz if gz.exists() else HERE / "touch_data.jsonl"
 
     stats = evaluate(args.model, data, limit=args.limit)
-    print(f"Evaluated {stats['n']} validation swipes from {data}")
-    print(f"  raw    median steps={stats['raw_steps_median']:.0f}  duration={stats['raw_ms_median']:.0f}ms  reach={stats['raw_reach_rate']*100:.0f}%")
-    print(f"  guided median steps={stats['guided_steps_median']:.0f}  duration={stats['guided_ms_median']:.0f}ms  reach={stats['guided_reach_rate']*100:.0f}%")
+    print(f"Evaluated {stats['raw']['all']['n']} validation swipes from {data}")
+    for name in ("raw", "noback", "guided"):
+        _print_mode(name, stats[name])
 
 
 if __name__ == "__main__":
