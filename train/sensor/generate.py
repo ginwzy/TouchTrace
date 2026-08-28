@@ -1,0 +1,160 @@
+"""Autoregressive IMU generation along a frozen touch path."""
+
+from __future__ import annotations
+
+import json
+import math
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+_TRAIN_ROOT = HERE.parent
+if str(_TRAIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TRAIN_ROOT))
+
+from sensor.config import model_config
+from sensor.features import IMU_DIMS, pack_sensor_step
+from touch.features import resolve_jsonl
+
+if TYPE_CHECKING:
+    import onnxruntime as ort
+
+COMPONENTS = int(model_config["components"])
+INPUT_DIMS = int(model_config["input_dims"])
+OUTPUT_DIMS = int(model_config["output_dims"])
+PARAMS_SIZE = COMPONENTS * (1 + 2 * OUTPUT_DIMS)
+
+
+def _first_existing(*paths: Path) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[-1]
+
+
+def default_onnx_path() -> Path:
+    name = model_config["onnx_model"]
+    return _first_existing(HERE / name, HERE.parent.parent / "inference" / "public" / name)
+
+
+def default_norm_path() -> Path:
+    name = model_config["norm"]
+    return _first_existing(HERE / name, HERE.parent.parent / "inference" / "public" / name)
+
+
+def default_data_path() -> Path:
+    return resolve_jsonl(HERE, "sensor_data")
+
+
+def load_norm(path: str | Path | None = None) -> dict:
+    norm_path = Path(path) if path else default_norm_path()
+    if not norm_path.exists():
+        raise SystemExit(f"Missing {norm_path}")
+    return json.loads(norm_path.read_text())
+
+
+def load_session(model_path: str | Path) -> ort.InferenceSession:
+    import onnxruntime as ort
+
+    return ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+
+
+def sample_imu_mdn(params: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    logits = params[:COMPONENTS]
+    u = rng.random(COMPONENTS)
+    gumbel = logits - np.log(-np.log(np.clip(u, 1e-12, 1.0)))
+    best = int(np.argmax(gumbel))
+    offset = COMPONENTS + best * (2 * OUTPUT_DIMS)
+    means = params[offset : offset + OUTPUT_DIMS]
+    raw_scale = params[offset + OUTPUT_DIMS : offset + 2 * OUTPUT_DIMS]
+    scales = np.where(raw_scale > 20, raw_scale, np.log1p(np.exp(np.minimum(raw_scale, 20.0))))
+    return rng.normal(means, scales)
+
+
+def mixture_mean(params: np.ndarray) -> np.ndarray:
+    """E[x] of the 6-d mixture (softmax over component means)."""
+    logits = np.asarray(params[:COMPONENTS], dtype=np.float64)
+    logits = logits - logits.max()
+    weights = np.exp(logits)
+    weights = weights / weights.sum()
+    means = np.asarray(params[COMPONENTS:], dtype=np.float64).reshape(COMPONENTS, 2 * OUTPUT_DIMS)[:, :OUTPUT_DIMS]
+    return weights @ means
+
+
+def decode_imu_mdn(params: np.ndarray, rng: np.random.Generator, temp: float = 1.0) -> np.ndarray:
+    """temp=0 is the mixture mean; temp=1 is a full MDN draw; in between interpolates."""
+    center = mixture_mean(params)
+    if temp <= 0:
+        return center
+    drawn = sample_imu_mdn(params, rng)
+    if temp >= 1:
+        return drawn
+    return center + float(temp) * (drawn - center)
+
+
+def sensor_mags(sensors: list[dict]) -> tuple[list[float], list[float], list[float]]:
+    ts, acc, gyro = [], [], []
+    for s in sensors:
+        a, g = s["accel"], s["gyro"]
+        ts.append(float(s["timestamp"]))
+        acc.append(math.hypot(a[0], a[1], a[2]))
+        gyro.append(math.hypot(g[0], g[1], g[2]))
+    return ts, acc, gyro
+
+
+def generate_sensor_along_path(
+    session: ort.InferenceSession,
+    path: list[dict],
+    imu0: list[float],
+    condition: str | None,
+    norm: dict,
+    rng: np.random.Generator,
+    remaining_frame: bool | None = None,
+    *,
+    temp: float | None = None,
+    teacher_sensors: list[dict] | None = None,
+) -> list[dict]:
+    """Roll out accel+gyro on a fixed touch path, starting from imu0.
+
+    temp: 0 = mixture mean, 1 = full MDN sample (default: model_config['mdn_temp']).
+    teacher_sensors: if set, each step is conditioned on the real previous IMU.
+    """
+    if len(path) < 2:
+        return [_sensor_point(path[0]["timestamp"], imu0)] if path else []
+    if teacher_sensors is not None and len(teacher_sensors) != len(path):
+        raise ValueError("teacher_sensors must align with path")
+    remaining_frame = model_config["remaining_frame"] if remaining_frame is None else remaining_frame
+    temp = float(model_config["mdn_temp"] if temp is None else temp)
+    mean = np.asarray(norm["mean"], dtype=np.float64)
+    std = np.asarray(norm["std"], dtype=np.float64)
+    target = path[-1]
+    pred = np.asarray(imu0, dtype=np.float64)
+    out = [_sensor_point(path[0]["timestamp"], pred.tolist())]
+    sequence: list[list[float]] = []
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
+
+    for i, (prev, curr) in enumerate(zip(path, path[1:])):
+        if teacher_sensors is not None:
+            s = teacher_sensors[i]
+            prev_imu = np.asarray(s["accel"] + s["gyro"], dtype=np.float64)
+        else:
+            prev_imu = pred
+        z_prev = ((prev_imu - mean) / std).tolist()
+        sequence.append(pack_sensor_step(z_prev, prev, curr, target, condition, remaining_frame))
+        arr = np.asarray(sequence, dtype=np.float32).reshape(1, len(sequence), INPUT_DIMS)
+        params = session.run([output_name], {input_name: arr})[0][0, -1, :PARAMS_SIZE]
+        pred = decode_imu_mdn(params, rng, temp=temp) * std + mean
+        out.append(_sensor_point(curr["timestamp"], pred.tolist()))
+    return out
+
+
+def _sensor_point(timestamp: float, imu: list[float]) -> dict:
+    return {
+        "timestamp": float(timestamp),
+        "accel": [float(v) for v in imu[:3]],
+        "gyro": [float(v) for v in imu[3:IMU_DIMS]],
+    }

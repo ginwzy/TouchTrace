@@ -128,8 +128,9 @@ python -m touch.preview --from-data --raw
 
 # Sensor model (training data is train/sensor/sensor_data.jsonl.gz)
 python convert_swipemotiondb.py --sensors   # needs data/raw/CSD4CA/*.csv
-python -m sensor.eval                       # |a| / |gyro| by seated/walking/stress
-python -m sensor.train                      # frozen-touch IMU LSTM+MDN
+python -m sensor.eval --gen-limit 80        # AR temp sweep vs human (0=mean, 1=full MDN)
+python -m sensor.preview                    # plots at mdn_temp=0.2; override with --temp
+python -m sensor.train                      # warmup 20 epochs TF, then scheduled sampling → p=0.7
 python -m sensor.convert                    # writes sensor.onnx + copies sensor_norm.json
 ```
 

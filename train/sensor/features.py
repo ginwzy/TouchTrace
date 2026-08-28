@@ -36,6 +36,28 @@ def subsample_paired(
     return [path[i] for i in keep], [sensors[i] for i in keep]
 
 
+def pack_sensor_step(
+    imu_prev: list[float],
+    prev: dict,
+    curr: dict,
+    target: dict,
+    condition: str | None,
+    remaining_frame: bool = True,
+) -> list[float]:
+    """13-d model input: prev IMU + remaining-frame kinematics + condition one-hot."""
+    dx = float(curr["x"]) - float(prev["x"])
+    dy = float(curr["y"]) - float(prev["y"])
+    dt = float(curr["timestamp"]) - float(prev["timestamp"])
+    rem_x = float(target["x"]) - float(prev["x"])
+    rem_y = float(target["y"]) - float(prev["y"])
+    if remaining_frame:
+        tan, nrm, rem = to_remaining_frame(dx, dy, rem_x, rem_y)
+        kin = [tan, nrm, dt, rem]
+    else:
+        kin = [dx, dy, dt, math.hypot(rem_x, rem_y)]
+    return [*imu_prev, *kin, *condition_onehot(condition)]
+
+
 def encode_sensor_trajectory(
     path: list[dict],
     sensors: list[dict],
@@ -50,29 +72,14 @@ def encode_sensor_trajectory(
     if len(path) != len(sensors) or len(path) < 2:
         return [], []
     tgt = target or path[-1]
-    target_x = float(tgt["x"])
-    target_y = float(tgt["y"])
-    cond = condition_onehot(condition)
     X: list[list[float]] = []
     Y: list[list[float]] = []
     for i in range(1, len(path)):
-        prev = path[i - 1]
-        curr = path[i]
-        dx = float(curr["x"]) - float(prev["x"])
-        dy = float(curr["y"]) - float(prev["y"])
-        dt = float(curr["timestamp"]) - float(prev["timestamp"])
-        rem_x = target_x - float(prev["x"])
-        rem_y = target_y - float(prev["y"])
-        if remaining_frame:
-            tan, nrm, rem = to_remaining_frame(dx, dy, rem_x, rem_y)
-            kin = [tan, nrm, dt, rem]
-        else:
-            kin = [dx, dy, dt, math.hypot(rem_x, rem_y)]
         imu_prev = _imu(sensors[i - 1])
         imu_curr = _imu(sensors[i])
         if imu_prev is None or imu_curr is None:
             return [], []
-        X.append(imu_prev + kin + cond)
+        X.append(pack_sensor_step(imu_prev, path[i - 1], path[i], tgt, condition, remaining_frame))
         Y.append(imu_curr)
     return X, Y
 

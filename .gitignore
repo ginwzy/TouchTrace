@@ -12,3 +12,5 @@ train/**/*.h5
 train/touch/*.onnx
 train/sensor/*.onnx
 inference/public/touch_lite.onnx
+
+train/sensor/plots/

@@ -6,6 +6,7 @@ Output: current accel/gyro (z-scored). Magnetometer is not trained.
     python -m sensor.train
     python -m sensor.train --lite
     python -m sensor.train --epochs 1
+    python -m sensor.train --no-ss
 """
 
 from __future__ import annotations
@@ -59,6 +60,62 @@ def _mask_weights(Y: np.ndarray, pad: float) -> np.ndarray:
     return (Y[:, :, 0] != pad).astype(np.float32)
 
 
+def scheduled_sampling_prob(epoch: int, warmup: int, ramp: int, ss_max: float) -> float:
+    if ss_max <= 0 or epoch < warmup:
+        return 0.0
+    if ramp <= 0:
+        return float(ss_max)
+    return float(min(ss_max, ss_max * (epoch - warmup + 1) / ramp))
+
+
+def mix_scheduled_imu(
+    x: np.ndarray,
+    y: np.ndarray,
+    pred_imu: np.ndarray,
+    pad: float,
+    prob: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Replace some next-step imu_prev channels with the model's previous prediction.
+
+    X[t, :6] conditions Y[t]. Predictions at t-1 therefore land on X[t, :6].
+    """
+    if prob <= 0:
+        return x
+    x_mix = np.array(x, dtype=np.float32, copy=True)
+    mask = y[:, :, 0] != pad
+    use = rng.random(mask.shape) < prob
+    use[:, 0] = False
+    use[:, 1:] &= mask[:, :-1] & mask[:, 1:]
+    prev = np.zeros_like(x_mix[..., :6])
+    prev[:, 1:] = pred_imu[:, :-1, :6]
+    x_mix[..., :6] = np.where(use[..., None], prev, x_mix[..., :6])
+    return x_mix
+
+
+def wrap_scheduled_sampling(inner, model, pad: float, state: dict, rng: np.random.Generator):
+    import tf_keras
+
+    class ScheduledSamplingSequence(tf_keras.utils.Sequence):
+        def __len__(self):
+            return len(inner)
+
+        def on_epoch_end(self):
+            inner.on_epoch_end()
+
+        def __getitem__(self, idx: int):
+            x, y, w = inner[idx]
+            p = float(state["p"])
+            if p <= 0:
+                return x, y, w
+            dist = model(x, training=False)
+            mu = dist.mean()
+            pred = np.asarray(mu.numpy() if hasattr(mu, "numpy") else mu, dtype=np.float32)
+            return mix_scheduled_imu(x, y, pred, pad, p, rng), y, w
+
+    return ScheduledSamplingSequence()
+
+
 def _zscore_list(xs, ys, mean, std, pad: float):
     out_x, out_y = [], []
     for x, y in zip(xs, ys):
@@ -79,6 +136,68 @@ def _write_norm(path: Path, mean, std, init_by_condition) -> None:
     print(f"Wrote {path}")
 
 
+def _make_callbacks(prefix: Path, *, early_stop: bool, ss_state: dict | None = None):
+    import tf_keras
+    from tf_keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, TerminateOnNaN
+
+    class _SSProb(tf_keras.callbacks.Callback):
+        def __init__(self, state: dict, warmup: int, ramp: int, ss_max: float):
+            super().__init__()
+            self.state = state
+            self.warmup = warmup
+            self.ramp = ramp
+            self.ss_max = ss_max
+
+        def on_epoch_begin(self, epoch, logs=None):
+            self.state["p"] = scheduled_sampling_prob(epoch, self.warmup, self.ramp, self.ss_max)
+            print(f"scheduled sampling p={self.state['p']:.3f}")
+
+    callbacks: list = [TerminateOnNaN()]
+    if ss_state is not None:
+        callbacks.append(
+            _SSProb(
+                ss_state,
+                int(model_config["ss_warmup_epochs"]),
+                int(model_config["ss_ramp_epochs"]),
+                float(model_config["ss_max"]),
+            )
+        )
+    callbacks.extend(
+        [
+            ModelCheckpoint(
+                filepath=str(HERE / f"{prefix}_last.h5"),
+                save_weights_only=True,
+                save_freq="epoch",
+                verbose=0,
+            ),
+            ModelCheckpoint(
+                filepath=str(HERE / f"{prefix}_best.h5"),
+                save_weights_only=True,
+                save_best_only=True,
+                monitor="val_loss",
+                verbose=1,
+            ),
+            ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=model_config["reduce_lr_factor"],
+                patience=model_config["reduce_lr_patience"],
+                min_lr=model_config["min_lr"],
+                verbose=1,
+            ),
+        ]
+    )
+    if early_stop:
+        callbacks.append(
+            EarlyStopping(
+                monitor="val_loss",
+                patience=model_config["early_stopping_patience"],
+                restore_best_weights=True,
+                verbose=1,
+            )
+        )
+    return callbacks
+
+
 def train(
     lite: bool = False,
     epochs: int | None = None,
@@ -87,9 +206,8 @@ def train(
     sequence: bool = False,
     min_step_px: float | None = None,
     no_augment: bool = False,
+    no_ss: bool = False,
 ) -> Path:
-    from tf_keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, TerminateOnNaN
-
     loader_mode = _resolve_loader_mode(prepad, sequence)
     _configure_onednn(loader_mode)
 
@@ -105,47 +223,24 @@ def train(
     noise_std = None if no_augment else model_config["input_noise_std"]
     remaining_frame = bool(model_config.get("remaining_frame", True))
     rng = np.random.default_rng(42)
+    ss_max = 0.0 if no_ss else float(model_config["ss_max"])
+    warmup = 0 if ss_max <= 0 else min(int(model_config["ss_warmup_epochs"]), n_epochs)
 
     log_train_devices(loader_mode)
     print(
         f"Parsing sensor data from {data_path} (max_steps={max_steps}, min_step_px={step_px}, "
         f"remaining_frame={remaining_frame}) ..."
     )
+    if ss_max > 0:
+        print(
+            f"scheduled sampling: warmup={warmup} ramp={model_config['ss_ramp_epochs']} "
+            f"max={ss_max} (mix mixture-mean IMU into imu_prev)"
+        )
     if not data_path.exists():
         raise SystemExit(f"Missing {data_path}. Run: python convert_swipemotiondb.py --sensors")
 
     model = build_sensor_model(units)
     model.summary()
-
-    callbacks = [
-        TerminateOnNaN(),
-        ModelCheckpoint(
-            filepath=str(HERE / f"{prefix}_last.h5"),
-            save_weights_only=True,
-            save_freq="epoch",
-            verbose=0,
-        ),
-        ModelCheckpoint(
-            filepath=str(HERE / f"{prefix}_best.h5"),
-            save_weights_only=True,
-            save_best_only=True,
-            monitor="val_loss",
-            verbose=1,
-        ),
-        ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=model_config["reduce_lr_factor"],
-            patience=model_config["reduce_lr_patience"],
-            min_lr=model_config["min_lr"],
-            verbose=1,
-        ),
-        EarlyStopping(
-            monitor="val_loss",
-            patience=model_config["early_stopping_patience"],
-            restore_best_weights=True,
-            verbose=1,
-        ),
-    ]
 
     init_by_condition = collect_init_by_condition(data_path)
 
@@ -173,8 +268,6 @@ def train(
             X_train, Y_train, W_train, batch_size, pad, shuffle=True, noise_std=noise_std, rng=rng
         )
         val_seq = make_prepad_sequence(X_val, Y_val, W_val, batch_size, pad, shuffle=False, noise_std=None, rng=rng)
-        _log_first_batch(train_seq, noise_std, False, "off", remaining_frame)
-        model.fit(train_seq, epochs=n_epochs, validation_data=val_seq, callbacks=callbacks)
     else:
         xs, ys = load_sensor_sequences(
             data_path, max_steps=max_steps, min_step_px=step_px, remaining_frame=remaining_frame
@@ -196,8 +289,30 @@ def train(
             x_train, y_train, w_train, batch_size, pad, True, noise_std, rng
         )
         val_seq = make_batch_sequence(x_val, y_val, w_val, batch_size, pad, False, None, rng)
-        _log_first_batch(train_seq, noise_std, False, "off", remaining_frame)
-        model.fit(train_seq, epochs=n_epochs, validation_data=val_seq, callbacks=callbacks)
+
+    _log_first_batch(train_seq, noise_std, False, "off", remaining_frame)
+    if warmup > 0:
+        print(f"Phase 1 teacher forcing: {warmup} epochs")
+        model.fit(
+            train_seq,
+            epochs=warmup,
+            validation_data=val_seq,
+            callbacks=_make_callbacks(prefix, early_stop=False),
+        )
+    if warmup < n_epochs:
+        ss_state = {"p": 0.0} if ss_max > 0 else None
+        fit_train, fit_val = train_seq, val_seq
+        if ss_state is not None:
+            fit_train = wrap_scheduled_sampling(train_seq, model, pad, ss_state, rng)
+            fit_val = wrap_scheduled_sampling(val_seq, model, pad, ss_state, rng)
+            print(f"Phase 2 scheduled sampling: epochs {warmup}→{n_epochs}")
+        model.fit(
+            fit_train,
+            epochs=n_epochs,
+            initial_epoch=warmup,
+            validation_data=fit_val,
+            callbacks=_make_callbacks(prefix, early_stop=True, ss_state=ss_state),
+        )
 
     _write_norm(HERE / model_config["norm"], norm["mean"], norm["std"], init_by_condition)
     out = HERE / weights_name
@@ -216,6 +331,7 @@ def main(argv: list[str] | None = None) -> None:
     loader.add_argument("--sequence", action="store_true", help="Dynamic batch padding (Mac Metal fallback)")
     parser.add_argument("--min-step-px", type=float, default=None, help="Path subsample threshold")
     parser.add_argument("--no-augment", action="store_true", help="Disable IMU input noise")
+    parser.add_argument("--no-ss", action="store_true", help="Disable scheduled sampling (teacher forcing only)")
     args = parser.parse_args(argv)
     train(
         lite=args.lite,
@@ -225,6 +341,7 @@ def main(argv: list[str] | None = None) -> None:
         sequence=args.sequence,
         min_step_px=args.min_step_px,
         no_augment=args.no_augment,
+        no_ss=args.no_ss,
     )
 
 

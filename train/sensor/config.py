@@ -21,6 +21,12 @@ model_config = {
     "reduce_lr_factor": 0.5,
     "min_lr": 1e-5,
     "remaining_frame": True,
+    # Generation: 0 = mixture mean, 1 = full MDN sample. Interpolates between.
+    "mdn_temp": 0.2,
+    # Train: teacher-force warmup, then mix model IMU-prev in with probability p.
+    "ss_warmup_epochs": 20,
+    "ss_ramp_epochs": 50,
+    "ss_max": 0.7,
     "weights": "sensor_model.h5",
     "weights_lite": "sensor_model_lite.h5",
     "onnx_model": "sensor.onnx",
