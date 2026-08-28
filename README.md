@@ -33,7 +33,7 @@ TouchTrace treats movement prediction as a **multivariate time series** problem:
 
 Using an MDN avoids [mode collapse](https://en.wikipedia.org/wiki/Mode_collapse)—each run produces a different, human-like trajectory.
 
-Training data for the touch model comes from [CSD4CA](https://doi.org/10.5281/zenodo.17931118) (SwipeMotionDB v2: touch + accelerometer + gyroscope + magnetometer). Phase 2 trains a separate IMU head on accel+gyro interpolated onto touch timestamps.
+Training data for the touch model comes from [CSD4CA](https://doi.org/10.5281/zenodo.17931118) (SwipeMotionDB v2: touch + accelerometer + gyroscope + magnetometer). Phase 2 trains a separate IMU head on accel+gyro interpolated onto touch timestamps. The archive is at `data/raw/CSD4CA.rar` (Git LFS); extract it to `data/raw/CSD4CA/` before running `convert_swipemotiondb.py`.
 
 ---
 

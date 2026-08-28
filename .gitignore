@@ -4,7 +4,11 @@ __pycache__
 node_modules/
 inference/README.md
 inference/dist
-data/
+# Keep data/raw/CSD4CA.rar (Git LFS); ignore extracted / other downloads
+data/*
+!data/raw/
+data/raw/*
+!data/raw/CSD4CA.rar
 train/touch/touch_data.jsonl
 train/sensor/sensor_data.jsonl
 train/touch/train.log
