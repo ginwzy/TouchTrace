@@ -1,7 +1,7 @@
 import math
 
-from eval_generate import path_metrics
-from generate import GenerateOptions, TouchStep, _clamp_step_mag, _no_backtrack_step
+from touch.eval import path_metrics
+from touch.generate import GenerateOptions, TouchStep, _clamp_step_mag, _no_backtrack_step
 
 
 def test_no_backtrack_redirects_reverse_step():

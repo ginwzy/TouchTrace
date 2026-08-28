@@ -1,0 +1,514 @@
+"""Train the Phase 1 touch LSTM + MDN on CSD4CA jsonl.
+
+Same architecture as the mouse pipeline: 5-d input, 3-d MDN output, 2×128 LSTM.
+Sequences are truncated to max_steps (default 128).
+
+Default: prepad once to max_steps and model.fit on fixed arrays (fast on CPU and CUDA).
+Use --sequence only if training hangs on Mac Metal.
+
+    python -m touch.train
+    python -m touch.train --lite
+    python -m touch.train --epochs 1
+    python -m touch.train --sequence   # Mac Metal fallback only
+    python -m touch.train --screen-frame  # old screen-axis dx/dy recipe
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+HERE = Path(__file__).resolve().parent
+_TRAIN_ROOT = HERE.parent
+if str(_TRAIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TRAIN_ROOT))
+
+import numpy as np
+
+from touch.config import model_config
+from touch.features import (
+    GEOM_TRANSFORMS,
+    angle_multipliers,
+    apply_geom_transform,
+    compute_sample_weights,
+    load_trajectory_jsonl,
+    load_trajectory_sequences,
+    resolve_jsonl,
+    scale_sample_weights_by_angle,
+    summarize_encoded_lengths,
+    swipe_angle_bucket,
+    unpad_sequences,
+)
+
+LoaderMode = str  # "prepad" | "sequence"
+
+
+def make_mdn_loss(pad: float, nll_clip: float):
+    import tensorflow as tf
+
+    def mdn_loss(y_true, y_pred):
+        mask = tf.cast(tf.math.not_equal(y_true[:, :, 0], pad), tf.float32)
+        safe_y_true = tf.where(tf.expand_dims(mask, -1) == 1.0, y_true, tf.zeros_like(y_true))
+        nll = -y_pred.log_prob(safe_y_true)
+        nll = tf.where(tf.math.is_finite(nll), nll, tf.ones_like(nll) * nll_clip)
+        nll = tf.clip_by_value(nll, 0.0, nll_clip)
+        loss = nll * mask
+        return tf.reduce_sum(loss) / (tf.reduce_sum(mask) + 1e-8)
+
+    return mdn_loss
+
+
+mdn_loss = make_mdn_loss(model_config["pad"], float(model_config["nll_clip"]))
+
+
+def _configure_onednn(loader_mode: LoaderMode) -> None:
+    if loader_mode == "prepad":
+        os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "1")
+    else:
+        os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+
+
+def _resolve_loader_mode(prepad: bool, sequence: bool) -> LoaderMode:
+    if prepad and sequence:
+        raise SystemExit("Use at most one of --prepad and --sequence.")
+    if sequence:
+        return "sequence"
+    return "prepad"
+
+
+def log_train_devices(loader_mode: LoaderMode) -> None:
+    import tensorflow as tf
+
+    gpus = tf.config.list_physical_devices("GPU")
+    device = "GPU" if gpus else "CPU"
+    print(f"TensorFlow {tf.__version__} device={device} GPUs={gpus} loader={loader_mode}")
+
+
+def make_batch_sequence(
+    xs,
+    ys,
+    ws,
+    batch_size: int,
+    pad: float,
+    shuffle: bool,
+    noise_std: list[float] | None = None,
+    rng: np.random.Generator | None = None,
+    geom_aug: bool = False,
+    angle_weight: bool = False,
+    angle_weight_max: float = 8.0,
+):
+    import tf_keras
+
+    class TouchBatchSequence(tf_keras.utils.Sequence):
+        """Pads each batch; optional input noise on (dx_prev, dy_prev, dt_prev)."""
+
+        def __init__(self):
+            self.xs = xs
+            self.ys = ys
+            self.ws = ws
+            self.batch_size = batch_size
+            self.pad = pad
+            self.shuffle = shuffle
+            self.noise_std = noise_std
+            self.geom_aug = geom_aug
+            self.angle_weight = angle_weight
+            self.angle_weight_max = angle_weight_max
+            self.rng = rng if rng is not None else np.random.default_rng()
+            self.indices = np.arange(len(xs))
+            self.on_epoch_end()
+
+        def __len__(self) -> int:
+            return math.ceil(len(self.xs) / self.batch_size)
+
+        def on_epoch_end(self) -> None:
+            if self.shuffle:
+                self.rng.shuffle(self.indices)
+
+        def __getitem__(self, idx: int):
+            batch_idx = self.indices[idx * self.batch_size : (idx + 1) * self.batch_size]
+            max_len = max(len(self.xs[i]) for i in batch_idx)
+            x = np.full((len(batch_idx), max_len, self.xs[0].shape[-1]), self.pad, dtype=np.float32)
+            y = np.full((len(batch_idx), max_len, self.ys[0].shape[-1]), self.pad, dtype=np.float32)
+            w = np.zeros((len(batch_idx), max_len), dtype=np.float32)
+            for row, i in enumerate(batch_idx):
+                n = len(self.xs[i])
+                xi = self.xs[i]
+                yi = self.ys[i]
+                if self.geom_aug:
+                    fn = GEOM_TRANSFORMS[int(self.rng.integers(len(GEOM_TRANSFORMS)))]
+                    xi, yi = apply_geom_transform(xi, yi, fn)
+                x[row, :n] = xi
+                y[row, :n] = yi
+                w[row, :n] = self.ws[i]
+                if self.noise_std is not None:
+                    n_ch = len(self.noise_std)
+                    scale = np.asarray(self.noise_std, dtype=np.float32)
+                    noise = self.rng.standard_normal((n, n_ch), dtype=np.float32) * scale
+                    x[row, :n, :n_ch] += noise
+            if self.angle_weight:
+                w = scale_sample_weights_by_angle(w, x, self.angle_weight_max)
+            return x, y, w
+
+    return TouchBatchSequence()
+
+
+def make_prepad_sequence(
+    X: np.ndarray,
+    Y: np.ndarray,
+    W: np.ndarray,
+    batch_size: int,
+    pad: float,
+    shuffle: bool,
+    noise_std: list[float] | None = None,
+    rng: np.random.Generator | None = None,
+    geom_aug: bool = False,
+    angle_weight: bool = False,
+    angle_weight_max: float = 8.0,
+):
+    xs, ys, ws = unpad_sequences(X, Y, W, pad)
+    return make_batch_sequence(
+        xs, ys, ws, batch_size, pad, shuffle, noise_std, rng, geom_aug, angle_weight, angle_weight_max
+    )
+
+
+def build_mdn_lstm(cfg: dict, lstm_units: int):
+    import tensorflow_probability as tfp
+    import tf_keras
+    from tf_keras.layers import LSTM, Dense, Input
+    from tf_keras.models import Sequential
+
+    # No Masking: Metal LSTM+Masking can hang. Post-padding is loss-masked instead.
+    tfpl = tfp.layers
+    model = Sequential(
+        [
+            Input(shape=(None, cfg["input_dims"])),
+            LSTM(lstm_units, return_sequences=True),
+            LSTM(lstm_units, return_sequences=True),
+            Dense(
+                int(
+                    tfpl.MixtureNormal.params_size(
+                        num_components=cfg["components"],
+                        event_shape=cfg["output_dims"],
+                    )
+                )
+            ),
+            tfpl.MixtureNormal(
+                num_components=cfg["components"],
+                event_shape=cfg["output_dims"],
+            ),
+        ]
+    )
+    try:
+        adam = tf_keras.optimizers.legacy.Adam
+    except AttributeError:
+        adam = tf_keras.optimizers.Adam
+    model.compile(
+        optimizer=adam(
+            learning_rate=cfg["learning_rate"],
+            clipnorm=float(cfg["clipnorm"]),
+        ),
+        loss=make_mdn_loss(cfg["pad"], float(cfg["nll_clip"])),
+    )
+    return model
+
+
+def build_touch_model(lstm_units: int):
+    return build_mdn_lstm(model_config, lstm_units)
+
+
+def _train_val_indices(n: int, val_fraction: float, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
+    n_val = max(1, int(n * val_fraction))
+    order = np.random.default_rng(seed).permutation(n)
+    return order[n_val:], order[:n_val]
+
+
+def _split_sequences(xs, ys, val_fraction: float, seed: int = 42):
+    train_idx, val_idx = _train_val_indices(len(xs), val_fraction, seed)
+    x_train = [xs[i] for i in train_idx]
+    y_train = [ys[i] for i in train_idx]
+    x_val = [xs[i] for i in val_idx]
+    y_val = [ys[i] for i in val_idx]
+    return x_train, y_train, x_val, y_val
+
+
+def _split_arrays(X: np.ndarray, Y: np.ndarray, val_fraction: float, seed: int = 42):
+    train_idx, val_idx = _train_val_indices(len(X), val_fraction, seed)
+    return X[train_idx], Y[train_idx], X[val_idx], Y[val_idx]
+
+
+def _resolve_data_path() -> Path:
+    return resolve_jsonl(HERE, "touch_data")
+
+
+def _angle_mix_line(items, label: str) -> str:
+    from collections import Counter
+
+    counts = Counter(items)
+    return (
+        f"Angle mix {label}: "
+        f"H={counts.get('H', 0)} D={counts.get('D', 0)} V={counts.get('V', 0)}"
+    )
+
+
+def _padded_angle_buckets(X: np.ndarray) -> list[str]:
+    return [swipe_angle_bucket(float(X[i, 0, 3]), float(X[i, 0, 4])) for i in range(len(X))]
+
+
+def _seq_angle_buckets(xs) -> list[str]:
+    return [swipe_angle_bucket(float(x[0, 3]), float(x[0, 4])) for x in xs]
+
+
+def _angle_weight_plan(angle_weight: bool, geom_aug: bool) -> tuple[bool, float, str]:
+    max_mult = float(model_config["angle_weight_max"])
+    in_batch = angle_weight and geom_aug
+    if in_batch:
+        mode = "post-aug"
+    elif angle_weight:
+        mode = "pre-aug"
+    else:
+        mode = "off"
+    return in_batch, max_mult, mode
+
+
+def _scale_seq_weights(xs, ws, max_mult: float):
+    mult = angle_multipliers(_seq_angle_buckets(xs), max_mult)
+    return [w * m for w, m in zip(ws, mult)]
+
+
+def _log_first_batch(seq, noise_std, geom_aug: bool, angle_mode: str, remaining_frame: bool) -> None:
+    xb, _, wb = seq[0]
+    print(
+        f"train batch {xb.shape}, sample_weight mean={wb[wb > 0].mean():.2f}, "
+        f"augment={noise_std is not None} geom_aug={geom_aug} angle_weight={angle_mode} "
+        f"remaining_frame={remaining_frame}"
+    )
+
+
+def train(
+    lite: bool = False,
+    epochs: int | None = None,
+    data: Path | None = None,
+    prepad: bool = False,
+    sequence: bool = False,
+    min_step_px: float | None = None,
+    no_augment: bool = False,
+    no_geom_aug: bool = False,
+    no_angle_weight: bool = False,
+    screen_frame: bool = False,
+) -> Path:
+    from tf_keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, TerminateOnNaN
+
+    loader_mode = _resolve_loader_mode(prepad, sequence)
+    _configure_onednn(loader_mode)
+
+    units = model_config["lstm_units_lite"] if lite else model_config["lstm_units"]
+    weights_name = model_config["weights_lite" if lite else "weights"]
+    prefix = Path(weights_name).stem
+    data_path = Path(data) if data else _resolve_data_path()
+    n_epochs = epochs if epochs is not None else model_config["epochs"]
+    pad = model_config["pad"]
+    batch_size = model_config["batch_size"]
+    max_steps = model_config["max_steps"]
+    step_px = model_config["min_step_px"] if min_step_px is None else min_step_px
+    noise_std = None if no_augment else model_config["input_noise_std"]
+    remaining_frame = bool(model_config.get("remaining_frame", True)) and not screen_frame
+    geom_aug = bool(model_config["geom_aug"]) and not no_geom_aug
+    angle_weight = not no_angle_weight
+    if remaining_frame:
+        if geom_aug:
+            print("remaining_frame=on: skipping geom_aug (directions already aligned)")
+            geom_aug = False
+        if angle_weight:
+            print("remaining_frame=on: skipping angle_weight (remaining is always on-axis)")
+            angle_weight = False
+    in_batch, max_mult, angle_mode = _angle_weight_plan(angle_weight, geom_aug)
+    rng = np.random.default_rng(42)
+
+    log_train_devices(loader_mode)
+    print(
+        f"Parsing data from {data_path} (max_steps={max_steps}, min_step_px={step_px}, "
+        f"remaining_frame={remaining_frame}) ..."
+    )
+    before = summarize_encoded_lengths(data_path, min_step_px=0.0)
+    after = summarize_encoded_lengths(data_path, min_step_px=step_px)
+    print(
+        f"Subsample {step_px}px: len mean {before['len_mean']:.1f} -> {after['len_mean']:.1f} "
+        f"({int(after['count'])} paths)"
+    )
+
+    model = build_touch_model(units)
+    model.summary()
+
+    callbacks = [
+        TerminateOnNaN(),
+        ModelCheckpoint(
+            filepath=str(HERE / f"{prefix}_last.h5"),
+            save_weights_only=True,
+            save_freq="epoch",
+            verbose=0,
+        ),
+        ModelCheckpoint(
+            filepath=str(HERE / f"{prefix}_best.h5"),
+            save_weights_only=True,
+            save_best_only=True,
+            monitor="val_loss",
+            verbose=1,
+        ),
+        ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=model_config["reduce_lr_factor"],
+            patience=model_config["reduce_lr_patience"],
+            min_lr=model_config["min_lr"],
+            verbose=1,
+        ),
+        EarlyStopping(
+            monitor="val_loss",
+            patience=model_config["early_stopping_patience"],
+            restore_best_weights=True,
+            verbose=1,
+        ),
+    ]
+
+    if loader_mode == "prepad":
+        X, Y = load_trajectory_jsonl(
+            data_path,
+            pad=pad,
+            max_steps=max_steps,
+            min_step_px=step_px,
+            remaining_frame=remaining_frame,
+        )
+        W = compute_sample_weights(
+            X,
+            Y,
+            pad,
+            model_config["loss_step_weight"],
+            model_config["loss_dist_weight"],
+        )
+        valid_steps = np.sum(Y[:, :, 0] != pad, axis=1)
+        print(
+            f"Loaded {len(X)} paths (prepad). "
+            f"len min/mean/max={valid_steps.min()}/{valid_steps.mean():.1f}/{valid_steps.max()}"
+        )
+        X_train, Y_train, X_val, Y_val = _split_arrays(X, Y, model_config["validation_split"])
+        train_idx, val_idx = _train_val_indices(len(X), model_config["validation_split"])
+        W_train, W_val = W[train_idx], W[val_idx]
+        print(_angle_mix_line(_padded_angle_buckets(X_train), "train") if not remaining_frame else "Angle mix train: remaining-frame (direction-invariant)")
+        if angle_weight and not geom_aug:
+            W_train = scale_sample_weights_by_angle(W_train, X_train, max_mult)
+        if angle_weight:
+            W_val = scale_sample_weights_by_angle(W_val, X_val, max_mult)
+        train_seq = make_prepad_sequence(
+            X_train,
+            Y_train,
+            W_train,
+            batch_size,
+            pad,
+            shuffle=True,
+            noise_std=noise_std,
+            rng=rng,
+            geom_aug=geom_aug,
+            angle_weight=in_batch,
+            angle_weight_max=max_mult,
+        )
+        val_seq = make_prepad_sequence(
+            X_val, Y_val, W_val, batch_size, pad, shuffle=False, noise_std=None, rng=rng
+        )
+        _log_first_batch(train_seq, noise_std, geom_aug, angle_mode, remaining_frame)
+        model.fit(train_seq, epochs=n_epochs, validation_data=val_seq, callbacks=callbacks)
+    else:
+        xs, ys = load_trajectory_sequences(
+            data_path, max_steps=max_steps, min_step_px=step_px, remaining_frame=remaining_frame
+        )
+        lengths = [len(x) for x in xs]
+        print(
+            f"Loaded {len(xs)} paths (sequence). "
+            f"len min/mean/max={min(lengths)}/{sum(lengths) / len(lengths):.1f}/{max(lengths)}"
+        )
+        x_train, y_train, x_val, y_val = _split_sequences(xs, ys, model_config["validation_split"])
+        w_train = [
+            compute_sample_weights(
+                x[np.newaxis], y[np.newaxis], pad, model_config["loss_step_weight"], model_config["loss_dist_weight"]
+            )[0]
+            for x, y in zip(x_train, y_train)
+        ]
+        w_val = [
+            compute_sample_weights(
+                x[np.newaxis], y[np.newaxis], pad, model_config["loss_step_weight"], model_config["loss_dist_weight"]
+            )[0]
+            for x, y in zip(x_val, y_val)
+        ]
+        print(_angle_mix_line(_seq_angle_buckets(x_train), "train") if not remaining_frame else "Angle mix train: remaining-frame (direction-invariant)")
+        if angle_weight and not geom_aug:
+            w_train = _scale_seq_weights(x_train, w_train, max_mult)
+        if angle_weight:
+            w_val = _scale_seq_weights(x_val, w_val, max_mult)
+        train_seq = make_batch_sequence(
+            x_train,
+            y_train,
+            w_train,
+            batch_size,
+            pad,
+            True,
+            noise_std,
+            rng,
+            geom_aug,
+            in_batch,
+            max_mult,
+        )
+        val_seq = make_batch_sequence(x_val, y_val, w_val, batch_size, pad, False, None, rng)
+        _log_first_batch(train_seq, noise_std, geom_aug, angle_mode, remaining_frame)
+        model.fit(train_seq, epochs=n_epochs, validation_data=val_seq, callbacks=callbacks)
+
+    out = HERE / weights_name
+    model.save_weights(str(out))
+    print(f"\nTraining complete. Weights: {out}")
+    return out
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Train the touch LSTM+MDN model")
+    parser.add_argument("--lite", action="store_true", help="Train 2×64 LSTM instead of 2×128")
+    parser.add_argument("--epochs", type=int, default=None, help="Override epoch count")
+    parser.add_argument("--data", type=Path, default=None, help="Path to touch_data.jsonl")
+    loader = parser.add_mutually_exclusive_group()
+    loader.add_argument(
+        "--prepad",
+        action="store_true",
+        help="Prepad to max_steps (default; same as omitting both loader flags)",
+    )
+    loader.add_argument(
+        "--sequence",
+        action="store_true",
+        help="Dynamic batch padding via Sequence (Mac Metal only if prepad hangs)",
+    )
+    parser.add_argument("--min-step-px", type=float, default=None, help="Path subsample threshold (default from config)")
+    parser.add_argument("--no-augment", action="store_true", help="Disable input noise augmentation")
+    parser.add_argument("--no-geom-aug", action="store_true", help="Disable 90° rotation augmentation")
+    parser.add_argument("--no-angle-weight", action="store_true", help="Disable H/D/V inverse-frequency weights")
+    parser.add_argument(
+        "--screen-frame",
+        action="store_true",
+        help="Encode dx/dy in screen axes (old recipe; remaining-frame is the default)",
+    )
+    args = parser.parse_args(argv)
+    train(
+        lite=args.lite,
+        epochs=args.epochs,
+        data=args.data,
+        prepad=args.prepad,
+        sequence=args.sequence,
+        min_step_px=args.min_step_px,
+        no_augment=args.no_augment,
+        no_geom_aug=args.no_geom_aug,
+        no_angle_weight=args.no_angle_weight,
+        screen_frame=args.screen_frame,
+    )
+
+
+if __name__ == "__main__":
+    main()

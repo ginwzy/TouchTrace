@@ -15,3 +15,7 @@ dependencies = [
 
 [tool.uv]
 dev-dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["train"]
+testpaths = ["train"]

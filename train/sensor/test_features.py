@@ -1,0 +1,83 @@
+"""Sensor encoding: fused path+IMU → (imu_prev, kinematics, condition) sequences."""
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+from sensor.features import (
+    apply_sensor_norm,
+    collect_init_by_condition,
+    condition_onehot,
+    encode_sensor_trajectory,
+    fit_sensor_norm,
+    load_sensor_jsonl,
+    subsample_paired,
+)
+
+
+def _fused(condition="walking"):
+    path = [
+        {"x": 0.0, "y": 0.0, "timestamp": 0.0},
+        {"x": 0.0, "y": 10.0, "timestamp": 16.0},
+        {"x": 0.0, "y": 40.0, "timestamp": 48.0},
+    ]
+    sensors = [
+        {"timestamp": 0.0, "accel": [0.0, 0.0, 9.8], "gyro": [0.0, 0.0, 0.0]},
+        {"timestamp": 16.0, "accel": [0.2, 0.0, 9.8], "gyro": [0.01, 0.0, 0.0]},
+        {"timestamp": 48.0, "accel": [0.4, 0.0, 9.8], "gyro": [0.02, 0.0, 0.0]},
+    ]
+    return path, sensors, condition
+
+
+def test_condition_onehot_order():
+    assert condition_onehot("seated") == [1.0, 0.0, 0.0]
+    assert condition_onehot("walking") == [0.0, 1.0, 0.0]
+    assert condition_onehot("stress") == [0.0, 0.0, 1.0]
+    assert condition_onehot("nope") == [0.0, 0.0, 0.0]
+
+
+def test_subsample_paired_keeps_aligned_sensors():
+    path, sensors, _ = _fused()
+    path.insert(1, {"x": 0.0, "y": 1.0, "timestamp": 8.0})
+    sensors.insert(1, {"timestamp": 8.0, "accel": [0.1, 0.0, 9.8], "gyro": [0.0, 0.0, 0.0]})
+    p2, s2 = subsample_paired(path, sensors, min_step_px=3.0)
+    assert [p["y"] for p in p2] == [0.0, 10.0, 40.0]
+    assert [s["accel"][0] for s in s2] == [0.0, 0.2, 0.4]
+
+
+def test_encode_sensor_uses_prev_imu_current_step_and_condition():
+    path, sensors, cond = _fused()
+    X, Y = encode_sensor_trajectory(path, sensors, cond, remaining_frame=True)
+    assert len(X) == 2
+    assert len(Y) == 2
+    assert X[0][:6] == [0.0, 0.0, 9.8, 0.0, 0.0, 0.0]
+    assert Y[0] == [0.2, 0.0, 9.8, 0.01, 0.0, 0.0]
+    assert X[0][-3:] == [0.0, 1.0, 0.0]
+    # remaining-frame: vertical step is pure tangent, rem is remaining length at prev
+    assert abs(X[0][6] - 10.0) < 1e-6
+    assert abs(X[0][7]) < 1e-6
+    assert abs(X[0][8] - 16.0) < 1e-6
+    assert abs(X[0][9] - 40.0) < 1e-6
+
+
+def test_load_sensor_jsonl_and_zscore(tmp_path: Path):
+    path, sensors, cond = _fused()
+    rec = {
+        "target": {"x": 0.0, "y": 40.0},
+        "meta": {"condition": cond},
+        "path": path,
+        "sensors": sensors,
+    }
+    jsonl = tmp_path / "touch_sensor_data.jsonl"
+    jsonl.write_text(json.dumps(rec) + "\n")
+    X, Y = load_sensor_jsonl(jsonl, pad=-999.0, min_step_px=0.0)
+    assert X.shape[-1] == 13
+    assert Y.shape[-1] == 6
+    assert Y.shape[0] == 1
+    norm = fit_sensor_norm(Y, pad=-999.0)
+    Xn, Yn = apply_sensor_norm(X, Y, norm["mean"], norm["std"], pad=-999.0)
+    assert abs(float(Yn.mean())) < 1e-5
+    inits = collect_init_by_condition(jsonl)
+    assert "walking" in inits
+    assert abs(inits["walking"]["mean"][2] - 9.8) < 1e-6

@@ -72,25 +72,24 @@ def apply_geom_transform(x: np.ndarray, y: np.ndarray, fn) -> tuple[np.ndarray, 
     return x, y
 
 
-def subsample_path(path: list[dict], min_step_px: float = 0.0) -> list[dict]:
-    """Keep endpoints; drop intermediate points until movement >= min_step_px."""
+def subsample_keep_indices(path: list[dict], min_step_px: float = 0.0) -> list[int]:
+    """Indices to keep: endpoints plus points that move at least min_step_px."""
     if min_step_px <= 0 or len(path) < 2:
-        return path
-
-    out = [path[0]]
-    anchor = path[0]
-    ax, ay = float(anchor["x"]), float(anchor["y"])
-
-    for pt in path[1:]:
-        px, py = float(pt["x"]), float(pt["y"])
+        return list(range(len(path)))
+    keep = [0]
+    ax, ay = float(path[0]["x"]), float(path[0]["y"])
+    for i in range(1, len(path)):
+        px, py = float(path[i]["x"]), float(path[i]["y"])
         if math.hypot(px - ax, py - ay) >= min_step_px:
-            out.append(pt)
-            anchor = pt
+            keep.append(i)
             ax, ay = px, py
+    if keep[-1] != len(path) - 1:
+        keep.append(len(path) - 1)
+    return keep
 
-    if out[-1] is not path[-1]:
-        out.append(path[-1])
-    return out
+
+def subsample_path(path: list[dict], min_step_px: float = 0.0) -> list[dict]:
+    return [path[i] for i in subsample_keep_indices(path, min_step_px)]
 
 
 def remaining_frame_axes(rem_x: float, rem_y: float) -> tuple[float, float, float]:
@@ -175,28 +174,38 @@ def _open_jsonl(filepath: str | Path):
     return path.open()
 
 
+def iter_jsonl(filepath: str | Path) -> Iterator[dict]:
+    with _open_jsonl(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
+def resolve_jsonl(directory: Path, stem: str) -> Path:
+    """Prefer an uncompressed jsonl (fresh convert) over the committed .gz."""
+    jsonl = directory / f"{stem}.jsonl"
+    gz = directory / f"{stem}.jsonl.gz"
+    return jsonl if jsonl.exists() else gz
+
+
 def iter_encoded_trajectories(
     filepath: str | Path,
     max_steps: int | None = DEFAULT_MAX_STEPS,
     min_step_px: float = 0.0,
     remaining_frame: bool = True,
 ) -> Iterator[tuple[list[list[float]], list[list[float]]]]:
-    with _open_jsonl(filepath) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            data = json.loads(line)
-            path = subsample_path(data.get("path", []), min_step_px=min_step_px)
-            if len(path) < 2:
-                continue
-            x_seq, y_seq = encode_trajectory(path, data["target"], remaining_frame=remaining_frame)
-            if max_steps is not None:
-                x_seq = x_seq[:max_steps]
-                y_seq = y_seq[:max_steps]
-            if not x_seq:
-                continue
-            yield x_seq, y_seq
+    for data in iter_jsonl(filepath):
+        path = subsample_path(data.get("path", []), min_step_px=min_step_px)
+        if len(path) < 2:
+            continue
+        x_seq, y_seq = encode_trajectory(path, data["target"], remaining_frame=remaining_frame)
+        if max_steps is not None:
+            x_seq = x_seq[:max_steps]
+            y_seq = y_seq[:max_steps]
+        if not x_seq:
+            continue
+        yield x_seq, y_seq
 
 
 def load_trajectory_sequences(

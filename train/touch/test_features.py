@@ -5,7 +5,7 @@ import gzip
 
 import numpy as np
 
-from features import (
+from touch.features import (
     GEOM_TRANSFORMS,
     apply_geom_transform,
     angle_multipliers,

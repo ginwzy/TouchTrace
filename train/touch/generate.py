@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
-from features import from_remaining_frame, remaining_frame_axes, to_remaining_frame
+_TRAIN_ROOT = Path(__file__).resolve().parent.parent
+if str(_TRAIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TRAIN_ROOT))
+
+from touch.features import from_remaining_frame, remaining_frame_axes, resolve_jsonl, to_remaining_frame
 
 if TYPE_CHECKING:
     import onnxruntime as ort
@@ -60,9 +65,7 @@ def default_onnx_path() -> Path:
 
 
 def default_data_path() -> Path:
-    here = Path(__file__).resolve().parent
-    gz = here / "touch_data.jsonl.gz"
-    return gz if gz.exists() else here / "touch_data.jsonl"
+    return resolve_jsonl(Path(__file__).resolve().parent, "touch_data")
 
 
 def softplus(x: float) -> float:

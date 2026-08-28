@@ -17,7 +17,7 @@ This project is under active development. See [TOUCH_EXTENSION_PLAN.md](./TOUCH_
 |-------|--------|--------|
 | Phase 0 | SwipeMotionDB exploration | Done — see plan appendix C |
 | Phase 1 | Touch trajectory JSON output | Working — remaining-frame LSTM+MDN, no-backtrack generation |
-| Phase 2 | Touch + sensor bundle output | Planned |
+| Phase 2 | Touch + sensor bundle output | Data ready — IMU LSTM+MDN training (accel+gyro, touch frozen) |
 
 The repository currently includes the **LSTM + MDN** training and inference pipeline (originally from [mousecrack](https://github.com/puffinsoft/mousecrack)), which serves as the foundation for touch model training.
 
@@ -33,7 +33,7 @@ TouchTrace treats movement prediction as a **multivariate time series** problem:
 
 Using an MDN avoids [mode collapse](https://en.wikipedia.org/wiki/Mode_collapse)—each run produces a different, human-like trajectory.
 
-Training data for the touch model will come from [SwipeMotionDB](https://doi.org/10.5281/zenodo.17171888) (touch + accelerometer + gyroscope + magnetometer, synchronized).
+Training data for the touch model comes from [CSD4CA](https://doi.org/10.5281/zenodo.17931118) (SwipeMotionDB v2: touch + accelerometer + gyroscope + magnetometer). Phase 2 trains a separate IMU head on accel+gyro interpolated onto touch timestamps.
 
 ---
 
@@ -118,16 +118,27 @@ source .venv/bin/activate
 export http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890
 uv sync
 
-cd train/touch
+cd train
 python -m pytest -q
-python train_touch.py          # remaining-frame LSTM+MDN
-python convert_touch.py        # writes train/touch/touch.onnx and inference/public/touch.onnx
-python eval_generate.py        # real vs raw vs no-backtrack: bow, duration, step size
-python preview_swipes.py --from-data
-python preview_swipes.py --from-data --raw
+python -m touch.train            # remaining-frame LSTM+MDN
+python -m touch.convert          # writes train/touch/touch.onnx and inference/public/touch.onnx
+python -m touch.eval             # real vs raw vs no-backtrack: bow, duration, step size
+python -m touch.preview --from-data
+python -m touch.preview --from-data --raw
+
+# Sensor model (training data is train/sensor/sensor_data.jsonl.gz)
+python convert_swipemotiondb.py --sensors   # needs data/raw/CSD4CA/*.csv
+python -m sensor.eval                       # |a| / |gyro| by seated/walking/stress
+python -m sensor.train                      # frozen-touch IMU LSTM+MDN
+python -m sensor.convert                    # writes sensor.onnx + copies sensor_norm.json
 ```
 
-**Google Colab (GPU):** open [`notebooks/train_touch_colab.ipynb`](notebooks/train_touch_colab.ipynb), set runtime to GPU, run all cells.
+**Google Colab (GPU):**
+
+- Touch: [`notebooks/train_touch_colab.ipynb`](notebooks/train_touch_colab.ipynb)
+- Sensor: [`notebooks/train_sensor_colab.ipynb`](notebooks/train_sensor_colab.ipynb)
+
+Set runtime to GPU, run all cells.
 
 ---
 

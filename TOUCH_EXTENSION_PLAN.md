@@ -1,7 +1,7 @@
 # TouchTrace 开发计划
 
 > 触摸轨迹 + 传感器数据生成（仅输出，不执行）  
-> 状态：Phase 0 完成；Phase 1–2 尚未实现  
+> 状态：Phase 0–1 完成；Phase 2 训练数据已就绪（独立 IMU 头，尚未训权重）  
 > 日期：2026-08-26（附录 C：2026-08-27）  
 > 仓库：https://github.com/ginwzy/TouchTrace
 
@@ -308,39 +308,28 @@ Touch 模块可打包为**零 native 依赖**的纯 JSON 生成库（若去掉 m
 
 ---
 
-## 5. 目录结构规划
-
-实现阶段建议的目录布局（当前尚未创建）：
+## 5. 目录结构
 
 ```
 touchtrace/
-├── TOUCH_EXTENSION_PLAN.md      # 本文档
+├── TOUCH_EXTENSION_PLAN.md
 ├── train/
+│   ├── convert_swipemotiondb.py # CSD4CA → jsonl（touch 与 sensor 共用）
 │   ├── data.jsonl               # 现有 mouse 数据
 │   ├── train.py                 # 现有 mouse 训练
-│   ├── touch/
-│   │   ├── convert_swipemotiondb.py   # SwipeMotionDB → jsonl
-│   │   ├── touch_data.jsonl           # 转换后的 touch 数据
-│   │   ├── touch_sensor_data.jsonl    # touch + sensor 融合数据
-│   │   ├── config_touch.py
-│   │   ├── train_touch.py
-│   │   └── train_touch_sensor.py
-│   └── ...
+│   ├── touch/                   # Phase 1 轨迹模型
+│   │   ├── touch_data.jsonl.gz
+│   │   ├── config.py / features.py / train.py / convert.py
+│   │   ├── generate.py / eval.py / preview.py
+│   └── sensor/                  # Phase 2 IMU 头（touch 冻结）
+│       ├── sensor_data.jsonl.gz
+│       ├── config.py / features.py / train.py / convert.py / eval.py
 ├── inference/
-│   ├── index.ts                 # 现有 mouse API
-│   ├── touch.ts                 # touchSteps(), touchSensorSteps()
-│   ├── cli.ts                   # 新增 touch-steps 子命令
-│   ├── config.ts                # 扩展 ModelType 或 TouchModelType
-│   ├── public/
-│   │   ├── model.onnx
-│   │   ├── model_lite.onnx
-│   │   ├── touch.onnx           # 新增
-│   │   └── touch_sensor.onnx    # 新增
-│   └── ...
-└── skills/
-    └── move-mouse/              # 现有
-    └── touch-swipe/             # 可选：Agent skill
-        └── SKILL.md
+│   ├── touch.ts
+│   └── public/touch.onnx        # sensor.onnx 训练后加入
+└── notebooks/
+    ├── train_touch_colab.ipynb
+    └── train_sensor_colab.ipynb
 ```
 
 ---
@@ -391,7 +380,7 @@ touchtrace/
 
 | 项 | 值 |
 |----|-----|
-| 脚本 | `train/touch/train_touch.py`（由 `train.py` 改编） |
+| 脚本 | `train/touch/train.py`（由 mouse `train.py` 改编） |
 | 数据 | `touch_data.jsonl` |
 | 配置 | 与 mouse 相同：input=5, output=3, LSTM 2×128, MDN 5 components |
 | Epochs | 200（与 mouse 一致，可按 validation loss 早停） |
@@ -405,8 +394,8 @@ touchtrace/
 
 | 项 | 值 |
 |----|-----|
-| 脚本 | `train/touch/train_touch_sensor.py` |
-| 数据 | `touch_sensor_data.jsonl` |
+| 脚本 | `train/sensor/train.py` |
+| 数据 | `train/sensor/sensor_data.jsonl.gz` |
 | 架构 | Shared LSTM + 双 MDN head |
 | Touch head output | 3 — dx, dy, dt |
 | Sensor head output | 9 — ax, ay, az, gx, gy, gz, mx, my, mz（或 6 维不含 mag） |
@@ -552,15 +541,15 @@ mousecrack touch-sensor-steps <fromX> <fromY> <toX> <toY> [standard|lite] [--no-
 
 ### Phase 2：Touch + Sensor（预估 2–3 周）
 
-| 任务 | 优先级 |
-|------|--------|
-| 融合 touch + sensor 的 jsonl | P0 |
-| `train_touch_sensor.py` 双头模型 | P0 |
-| 导出 `touch_sensor.onnx` | P0 |
-| `touchSensorSteps()` API | P0 |
-| CLI `touch-sensor-steps` | P1 |
-| Sensor 归一化/反归一化 | P0 |
-| 评估：sensor 分布对比 | P1 |
+| 任务 | 优先级 | 状态 |
+|------|--------|------|
+| 融合 touch + sensor 的 jsonl | P0 | 完成（`train/sensor/sensor_data.jsonl.gz`，acc+gyro，无 mag） |
+| `train/sensor/train.py` 独立 IMU 头（touch 冻结） | P0 | 脚本就绪；Colab：`notebooks/train_sensor_colab.ipynb` |
+| 导出 `sensor.onnx` | P0 | |
+| `touchSensorSteps()` API | P0 | |
+| CLI `touch-sensor-steps` | P1 | |
+| Sensor 归一化/反归一化 | P0 | 训练时写入 `sensor_norm.json` |
+| 评估：sensor 分布对比 | P1 | `python -m sensor.eval` 真人基线已可用 |
 
 **验收标准：**
 
