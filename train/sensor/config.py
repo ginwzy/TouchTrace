@@ -23,10 +23,12 @@ model_config = {
     "remaining_frame": True,
     # Generation: 0 = mixture mean, 1 = full MDN sample. Interpolates between.
     "mdn_temp": 0.2,
-    # Train: teacher-force warmup, then mix model IMU-prev in with probability p.
+    # Train: teacher-force warmup, then mix model imu_prev in with probability p.
+    # Y is ΔIMU (current − previous); SS feeds sampled deltas integrated back to abs IMU.
     "ss_warmup_epochs": 20,
     "ss_ramp_epochs": 50,
-    "ss_max": 0.7,
+    "ss_max": 1.0,
+    "ss_temp": 0.2,
     "weights": "sensor_model.h5",
     "weights_lite": "sensor_model_lite.h5",
     "onnx_model": "sensor.onnx",

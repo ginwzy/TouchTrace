@@ -65,10 +65,7 @@ def encode_sensor_trajectory(
     remaining_frame: bool = True,
     target: dict | None = None,
 ) -> tuple[list[list[float]], list[list[float]]]:
-    """One step of IMU given previous IMU, the touch step just taken, and condition.
-
-    Y is raw device-frame accel+gyro; z-score is applied later on the train split.
-    """
+    """Y is current − previous accel+gyro in device frame; z-score is applied later."""
     if len(path) != len(sensors) or len(path) < 2:
         return [], []
     tgt = target or path[-1]
@@ -80,7 +77,7 @@ def encode_sensor_trajectory(
         if imu_prev is None or imu_curr is None:
             return [], []
         X.append(pack_sensor_step(imu_prev, path[i - 1], path[i], tgt, condition, remaining_frame))
-        Y.append(imu_curr)
+        Y.append([c - p for p, c in zip(imu_prev, imu_curr)])
     return X, Y
 
 
@@ -170,35 +167,66 @@ def collect_init_by_condition(filepath: str | Path) -> dict[str, dict[str, list[
     return out
 
 
-def fit_sensor_norm(Y: np.ndarray, pad: float) -> dict[str, list[float]]:
+def _channel_mean_std(vals: np.ndarray, width: int) -> tuple[list[float], list[float]]:
+    if vals.size == 0:
+        return [0.0] * width, [1.0] * width
+    mean = vals.mean(axis=0).astype(np.float64)
+    std = vals.std(axis=0).astype(np.float64)
+    std = np.where(std < 1e-6, 1.0, std)
+    return mean.tolist(), std.tolist()
+
+
+def fit_sensor_norm(X: np.ndarray, Y: np.ndarray, pad: float) -> dict:
+    """Fit absolute-IMU stats for X[..., :6] and ΔIMU stats for Y."""
     mask = Y[:, :, 0] != pad
-    if not np.any(mask):
-        mean = np.zeros(Y.shape[-1], dtype=np.float64)
-        std = np.ones(Y.shape[-1], dtype=np.float64)
-    else:
-        vals = Y[mask]
-        mean = vals.mean(axis=0).astype(np.float64)
-        std = vals.std(axis=0).astype(np.float64)
-        std = np.where(std < 1e-6, 1.0, std)
-    return {"mean": mean.tolist(), "std": std.tolist()}
+    imu_mean, imu_std = _channel_mean_std(X[mask][..., :IMU_DIMS], IMU_DIMS)
+    delta_mean, delta_std = _channel_mean_std(Y[mask], IMU_DIMS)
+    return {
+        "mean": imu_mean,
+        "std": imu_std,
+        "delta_mean": delta_mean,
+        "delta_std": delta_std,
+        "target": "delta",
+        "axes": ["ax", "ay", "az", "gx", "gy", "gz"],
+    }
 
 
 def apply_sensor_norm(
     X: np.ndarray,
     Y: np.ndarray,
-    mean: list[float] | np.ndarray,
-    std: list[float] | np.ndarray,
+    norm: dict,
     pad: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Z-score IMU channels on X[..., :6] and all of Y; leave pad cells untouched."""
-    mean_a = np.asarray(mean, dtype=np.float32)
-    std_a = np.asarray(std, dtype=np.float32)
+    """Z-score prev IMU on X[..., :6] and ΔIMU on Y; leave pad cells untouched."""
+    imu_mean = np.asarray(norm["mean"], dtype=np.float32)
+    imu_std = np.asarray(norm["std"], dtype=np.float32)
+    d_mean = np.asarray(norm["delta_mean"], dtype=np.float32)
+    d_std = np.asarray(norm["delta_std"], dtype=np.float32)
     mask = (Y[:, :, 0] != pad)[..., None]
     x = np.array(X, dtype=np.float32, copy=True)
     y = np.array(Y, dtype=np.float32, copy=True)
-    x[..., :IMU_DIMS] = np.where(mask, (x[..., :IMU_DIMS] - mean_a) / std_a, x[..., :IMU_DIMS])
-    y = np.where(mask, (y - mean_a) / std_a, y)
+    x[..., :IMU_DIMS] = np.where(mask, (x[..., :IMU_DIMS] - imu_mean) / imu_std, x[..., :IMU_DIMS])
+    y = np.where(mask, (y - d_mean) / d_std, y)
     return x, y
+
+
+def abs_z_from_delta_z(prev_abs_z: np.ndarray, delta_z: np.ndarray, norm: dict) -> np.ndarray:
+    """Integrate a z-scored ΔIMU onto a z-scored previous IMU."""
+    mean = np.asarray(norm["mean"], dtype=np.float64)
+    std = np.asarray(norm["std"], dtype=np.float64)
+    d_mean = np.asarray(norm["delta_mean"], dtype=np.float64)
+    d_std = np.asarray(norm["delta_std"], dtype=np.float64)
+    prev = prev_abs_z.astype(np.float64) * std + mean
+    delta = delta_z.astype(np.float64) * d_std + d_mean
+    return ((prev + delta - mean) / std).astype(np.float32)
+
+
+def require_delta_norm(norm: dict) -> dict:
+    if norm.get("target") != "delta" or "delta_mean" not in norm or "delta_std" not in norm:
+        raise ValueError(
+            "sensor_norm.json is missing delta stats; retrain after the ΔIMU target change"
+        )
+    return norm
 
 
 def _imu(sample: dict) -> list[float] | None:

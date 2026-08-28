@@ -1,22 +1,31 @@
 import numpy as np
 
+from sensor.generate import mix_mdn_draw
 from sensor.train import mix_scheduled_imu, scheduled_sampling_prob
 
 
 def test_ss_prob_zero_during_warmup():
-    assert scheduled_sampling_prob(0, warmup=20, ramp=50, ss_max=0.7) == 0.0
-    assert scheduled_sampling_prob(19, warmup=20, ramp=50, ss_max=0.7) == 0.0
+    assert scheduled_sampling_prob(0, warmup=20, ramp=50, ss_max=1.0) == 0.0
+    assert scheduled_sampling_prob(19, warmup=20, ramp=50, ss_max=1.0) == 0.0
 
 
 def test_ss_prob_ramps_then_caps():
-    p0 = scheduled_sampling_prob(20, warmup=20, ramp=50, ss_max=0.7)
-    p_mid = scheduled_sampling_prob(44, warmup=20, ramp=50, ss_max=0.7)
-    p_end = scheduled_sampling_prob(69, warmup=20, ramp=50, ss_max=0.7)
-    p_late = scheduled_sampling_prob(200, warmup=20, ramp=50, ss_max=0.7)
-    assert abs(p0 - 0.7 / 50) < 1e-9
+    p0 = scheduled_sampling_prob(20, warmup=20, ramp=50, ss_max=1.0)
+    p_mid = scheduled_sampling_prob(44, warmup=20, ramp=50, ss_max=1.0)
+    p_end = scheduled_sampling_prob(69, warmup=20, ramp=50, ss_max=1.0)
+    p_late = scheduled_sampling_prob(200, warmup=20, ramp=50, ss_max=1.0)
+    assert abs(p0 - 1.0 / 50) < 1e-9
     assert p_mid > p0
-    assert abs(p_end - 0.7) < 1e-9
-    assert p_late == 0.7
+    assert abs(p_end - 1.0) < 1e-9
+    assert p_late == 1.0
+
+
+def test_mix_mdn_draw_interpolates():
+    mean = np.zeros(6)
+    sample = np.ones(6)
+    assert np.allclose(mix_mdn_draw(mean, sample, 0.0), 0.0)
+    assert np.allclose(mix_mdn_draw(mean, sample, 1.0), 1.0)
+    assert np.allclose(mix_mdn_draw(mean, sample, 0.2), 0.2)
 
 
 def test_mix_replaces_next_prev_with_previous_prediction():

@@ -1,7 +1,7 @@
 """Train a frozen-touch IMU LSTM+MDN on fused CSD4CA jsonl.
 
 Input: previous accel/gyro (z-scored) + remaining-frame touch step + condition one-hot.
-Output: current accel/gyro (z-scored). Magnetometer is not trained.
+Output: current − previous accel/gyro (z-scored ΔIMU). Magnetometer is not trained.
 
     python -m sensor.train
     python -m sensor.train --lite
@@ -28,12 +28,14 @@ import numpy as np
 
 from sensor.config import model_config
 from sensor.features import (
+    abs_z_from_delta_z,
     apply_sensor_norm,
     collect_init_by_condition,
     fit_sensor_norm,
     load_sensor_jsonl,
     load_sensor_sequences,
 )
+from sensor.generate import mix_mdn_draw
 from touch.features import resolve_jsonl
 from touch.train import (
     _configure_onednn,
@@ -93,8 +95,19 @@ def mix_scheduled_imu(
     return x_mix
 
 
-def wrap_scheduled_sampling(inner, model, pad: float, state: dict, rng: np.random.Generator):
+def wrap_scheduled_sampling(
+    inner,
+    model,
+    pad: float,
+    state: dict,
+    rng: np.random.Generator,
+    norm: dict,
+    ss_temp: float,
+):
     import tf_keras
+
+    def _as_f32(t):
+        return np.asarray(t.numpy() if hasattr(t, "numpy") else t, dtype=np.float32)
 
     class ScheduledSamplingSequence(tf_keras.utils.Sequence):
         def __len__(self):
@@ -109,27 +122,29 @@ def wrap_scheduled_sampling(inner, model, pad: float, state: dict, rng: np.rando
             if p <= 0:
                 return x, y, w
             dist = model(x, training=False)
-            mu = dist.mean()
-            pred = np.asarray(mu.numpy() if hasattr(mu, "numpy") else mu, dtype=np.float32)
-            return mix_scheduled_imu(x, y, pred, pad, p, rng), y, w
+            mean = _as_f32(dist.mean())
+            if ss_temp <= 0:
+                delta_z = mean
+            else:
+                delta_z = mix_mdn_draw(mean, _as_f32(dist.sample()), ss_temp)
+            pred_abs_z = abs_z_from_delta_z(x[..., :6], delta_z, norm)
+            return mix_scheduled_imu(x, y, pred_abs_z, pad, p, rng), y, w
 
     return ScheduledSamplingSequence()
 
 
-def _zscore_list(xs, ys, mean, std, pad: float):
+def _zscore_list(xs, ys, norm, pad: float):
     out_x, out_y = [], []
     for x, y in zip(xs, ys):
-        xn, yn = apply_sensor_norm(x[None], y[None], mean, std, pad)
+        xn, yn = apply_sensor_norm(x[None], y[None], norm, pad)
         out_x.append(xn[0])
         out_y.append(yn[0])
     return out_x, out_y
 
 
-def _write_norm(path: Path, mean, std, init_by_condition) -> None:
+def _write_norm(path: Path, norm: dict, init_by_condition) -> None:
     payload = {
-        "mean": [float(v) for v in mean],
-        "std": [float(v) for v in std],
-        "axes": ["ax", "ay", "az", "gx", "gy", "gz"],
+        **norm,
         "init_by_condition": init_by_condition,
     }
     path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -234,7 +249,7 @@ def train(
     if ss_max > 0:
         print(
             f"scheduled sampling: warmup={warmup} ramp={model_config['ss_ramp_epochs']} "
-            f"max={ss_max} (mix mixture-mean IMU into imu_prev)"
+            f"max={ss_max} temp={model_config['ss_temp']} (mix sampled ΔIMU into imu_prev)"
         )
     if not data_path.exists():
         raise SystemExit(f"Missing {data_path}. Run: python convert_swipemotiondb.py --sensors")
@@ -253,9 +268,9 @@ def train(
             remaining_frame=remaining_frame,
         )
         X_train, Y_train, X_val, Y_val = _split_arrays(X, Y, model_config["validation_split"])
-        norm = fit_sensor_norm(Y_train, pad)
-        X_train, Y_train = apply_sensor_norm(X_train, Y_train, norm["mean"], norm["std"], pad)
-        X_val, Y_val = apply_sensor_norm(X_val, Y_val, norm["mean"], norm["std"], pad)
+        norm = fit_sensor_norm(X_train, Y_train, pad)
+        X_train, Y_train = apply_sensor_norm(X_train, Y_train, norm, pad)
+        X_val, Y_val = apply_sensor_norm(X_val, Y_val, norm, pad)
         W_train = _mask_weights(Y_train, pad)
         W_val = _mask_weights(Y_val, pad)
         valid_steps = np.sum(Y_train[:, :, 0] != pad, axis=1)
@@ -263,7 +278,6 @@ def train(
             f"Loaded {len(X)} paths (prepad). "
             f"train len min/mean/max={valid_steps.min()}/{valid_steps.mean():.1f}/{valid_steps.max()}"
         )
-        print(f"IMU z-score mean={np.round(norm['mean'], 4).tolist()} std={np.round(norm['std'], 4).tolist()}")
         train_seq = make_prepad_sequence(
             X_train, Y_train, W_train, batch_size, pad, shuffle=True, noise_std=noise_std, rng=rng
         )
@@ -273,10 +287,11 @@ def train(
             data_path, max_steps=max_steps, min_step_px=step_px, remaining_frame=remaining_frame
         )
         x_train, y_train, x_val, y_val = _split_sequences(xs, ys, model_config["validation_split"])
-        stacked = np.concatenate(y_train, axis=0)[None, ...]
-        norm = fit_sensor_norm(stacked, pad)
-        x_train, y_train = _zscore_list(x_train, y_train, norm["mean"], norm["std"], pad)
-        x_val, y_val = _zscore_list(x_val, y_val, norm["mean"], norm["std"], pad)
+        stacked_x = np.concatenate(x_train, axis=0)[None, ...]
+        stacked_y = np.concatenate(y_train, axis=0)[None, ...]
+        norm = fit_sensor_norm(stacked_x, stacked_y, pad)
+        x_train, y_train = _zscore_list(x_train, y_train, norm, pad)
+        x_val, y_val = _zscore_list(x_val, y_val, norm, pad)
         w_train = [np.ones(len(y), dtype=np.float32) for y in y_train]
         w_val = [np.ones(len(y), dtype=np.float32) for y in y_val]
         lengths = [len(x) for x in xs]
@@ -284,11 +299,18 @@ def train(
             f"Loaded {len(xs)} paths (sequence). "
             f"len min/mean/max={min(lengths)}/{sum(lengths) / len(lengths):.1f}/{max(lengths)}"
         )
-        print(f"IMU z-score mean={np.round(norm['mean'], 4).tolist()} std={np.round(norm['std'], 4).tolist()}")
         train_seq = make_batch_sequence(
             x_train, y_train, w_train, batch_size, pad, True, noise_std, rng
         )
         val_seq = make_batch_sequence(x_val, y_val, w_val, batch_size, pad, False, None, rng)
+
+    print(
+        f"IMU z-score mean={np.round(norm['mean'], 4).tolist()} std={np.round(norm['std'], 4).tolist()}"
+    )
+    print(
+        f"ΔIMU z-score mean={np.round(norm['delta_mean'], 4).tolist()} "
+        f"std={np.round(norm['delta_std'], 4).tolist()}"
+    )
 
     _log_first_batch(train_seq, noise_std, False, "off", remaining_frame)
     if warmup > 0:
@@ -301,20 +323,21 @@ def train(
         )
     if warmup < n_epochs:
         ss_state = {"p": 0.0} if ss_max > 0 else None
-        fit_train, fit_val = train_seq, val_seq
+        fit_train = train_seq
         if ss_state is not None:
-            fit_train = wrap_scheduled_sampling(train_seq, model, pad, ss_state, rng)
-            fit_val = wrap_scheduled_sampling(val_seq, model, pad, ss_state, rng)
-            print(f"Phase 2 scheduled sampling: epochs {warmup}→{n_epochs}")
+            fit_train = wrap_scheduled_sampling(
+                train_seq, model, pad, ss_state, rng, norm, float(model_config["ss_temp"])
+            )
+            print(f"Phase 2 scheduled sampling: epochs {warmup}→{n_epochs} (val stays teacher-forced)")
         model.fit(
             fit_train,
             epochs=n_epochs,
             initial_epoch=warmup,
-            validation_data=fit_val,
+            validation_data=val_seq,
             callbacks=_make_callbacks(prefix, early_stop=True, ss_state=ss_state),
         )
 
-    _write_norm(HERE / model_config["norm"], norm["mean"], norm["std"], init_by_condition)
+    _write_norm(HERE / model_config["norm"], norm, init_by_condition)
     out = HERE / weights_name
     model.save_weights(str(out))
     print(f"\nTraining complete. Weights: {out}")

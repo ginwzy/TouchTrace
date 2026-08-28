@@ -149,6 +149,7 @@ def compare_generated(
     limit: int = 200,
     seed: int = 42,
     temps: tuple[float, ...] = (0.0, 0.2, 0.3, 0.5, 1.0),
+    report: bool = False,
 ) -> None:
     val = val_rows(rows, model_config["validation_split"], seed=seed, limit=limit)
     step_px = float(model_config["min_step_px"])
@@ -198,6 +199,7 @@ def compare_generated(
         f"(frozen touch path, min_step_px={step_px})"
     )
     print("ar = autoregressive; tf = teacher-forced; t* = MDN temp (0=mean, 1=full sample)")
+    extras: dict[str, dict] = {}
     for label in labels:
         extra = {}
         for cond in CONDITIONS:
@@ -208,6 +210,7 @@ def compare_generated(
             mean_last = sum(last) / len(last)
             mean_t0 = sum(t0) / len(t0)
             extra[cond] = {"last_a": mean_last, "drift": mean_last / max(mean_t0, 1e-6)}
+        extras[label] = extra
         print(label)
         _print_mag_table(n[label], buckets[label], first[label], extra)
     print("\npointwise |gen-human| after t0 (median)")
@@ -219,6 +222,43 @@ def compare_generated(
             if not ae:
                 continue
             print(f"{name:<12} {cond:<10} {_pct(ae, 50):>10.3f} {_pct(ge, 50):>10.4f}")
+    if report:
+        _print_paste_report(used, labels, buckets, err, extras)
+
+
+def _print_paste_report(
+    used: int,
+    labels: tuple[str, ...],
+    buckets: dict,
+    err: dict,
+    extras: dict,
+) -> None:
+    print("\n=== SENSOR EVAL REPORT (paste into chat) ===")
+    print(
+        f"target=delta  mdn_temp={model_config['mdn_temp']}  "
+        f"ss_max={model_config['ss_max']}  ss_temp={model_config['ss_temp']}  n={used}"
+    )
+    print(f"{'mode':<12} {'cond':<10} {'|a| p50':>8} {'|a| p90':>8} {'|g| p50':>8} {'|da|':>8} {'|dg|':>8} {'last/t0':>8}")
+    for label in labels:
+        extra = extras.get(label) or {}
+        for cond in CONDITIONS:
+            acc = sorted(buckets[label][cond]["acc"])
+            gyro = sorted(buckets[label][cond]["gyro"])
+            if not acc:
+                continue
+            da = dg = float("nan")
+            if label in err:
+                ae = sorted(err[label][cond]["acc"])
+                ge = sorted(err[label][cond]["gyro"])
+                if ae:
+                    da, dg = _pct(ae, 50), _pct(ge, 50)
+            drift = extra.get(cond, {}).get("drift", float("nan"))
+            print(
+                f"{label:<12} {cond:<10} {_pct(acc, 50):>8.3f} {_pct(acc, 90):>8.3f} "
+                f"{_pct(gyro, 50):>8.4f} {da:>8.3f} {dg:>8.4f} {drift:>8.2f}"
+            )
+    print("Watch: AR |dg| vs tf-mean |dg| (should close); walking |a| p90 vs real.")
+    print("=== END REPORT ===")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -234,6 +274,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Comma-separated MDN temps for autoregressive compare (0=mean, 1=full sample)",
     )
     parser.add_argument("--skip-gen", action="store_true", help="Human baseline only")
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Print a compact paste-into-chat summary after the generation compare",
+    )
     args = parser.parse_args(argv)
     path = args.data if args.data else default_sensor_data_path()
     if not path.exists():
@@ -257,6 +302,7 @@ def main(argv: list[str] | None = None) -> None:
         load_norm(args.norm or default_norm_path()),
         limit=args.gen_limit,
         temps=temps,
+        report=args.report,
     )
 
 

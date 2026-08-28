@@ -1,10 +1,17 @@
-import math
-
 import numpy as np
 
 from sensor.features import encode_sensor_trajectory, pack_sensor_step
 from sensor.generate import PARAMS_SIZE, decode_imu_mdn, generate_sensor_along_path, mixture_mean, sample_imu_mdn
 from sensor.test_features import _fused
+
+
+IDENTITY_NORM = {
+    "mean": [0.0] * 6,
+    "std": [1.0] * 6,
+    "delta_mean": [0.0] * 6,
+    "delta_std": [1.0] * 6,
+    "target": "delta",
+}
 
 
 class _FakeTensor:
@@ -73,12 +80,11 @@ class _RecordSession(_DeltaSession):
 def test_teacher_forcing_uses_real_previous_imu():
     path, sensors, cond = _fused()
     imu0 = sensors[0]["accel"] + sensors[0]["gyro"]
-    norm = {"mean": [0.0] * 6, "std": [1.0] * 6}
     ar = _RecordSession()
     tf = _RecordSession()
-    generate_sensor_along_path(ar, path, imu0, cond, norm, np.random.default_rng(0), temp=0)
+    generate_sensor_along_path(ar, path, imu0, cond, IDENTITY_NORM, np.random.default_rng(0), temp=0)
     generate_sensor_along_path(
-        tf, path, imu0, cond, norm, np.random.default_rng(0), temp=0, teacher_sensors=sensors
+        tf, path, imu0, cond, IDENTITY_NORM, np.random.default_rng(0), temp=0, teacher_sensors=sensors
     )
     assert np.allclose(ar.prev_z[0], imu0)
     assert np.allclose(tf.prev_z[0], imu0)
@@ -89,13 +95,35 @@ def test_teacher_forcing_uses_real_previous_imu():
 def test_generate_keeps_timestamps_and_init():
     path, sensors, cond = _fused()
     imu0 = sensors[0]["accel"] + sensors[0]["gyro"]
-    norm = {"mean": [0.0] * 6, "std": [1.0] * 6}
-    out = generate_sensor_along_path(_DeltaSession(), path, imu0, cond, norm, np.random.default_rng(0))
+    out = generate_sensor_along_path(
+        _DeltaSession(), path, imu0, cond, IDENTITY_NORM, np.random.default_rng(0), temp=0
+    )
     assert len(out) == len(path)
     assert [s["timestamp"] for s in out] == [p["timestamp"] for p in path]
     assert out[0]["accel"] == sensors[0]["accel"]
     assert out[0]["gyro"] == sensors[0]["gyro"]
-    assert math.hypot(*out[1]["accel"]) < 1.0
+    assert np.allclose(out[1]["accel"], sensors[0]["accel"])
+    assert np.allclose(out[1]["gyro"], sensors[0]["gyro"])
+
+
+class _ConstDeltaSession(_DeltaSession):
+    """Component-0 mean is a constant Δax in z-space."""
+
+    def run(self, _names, _feeds):
+        params = super().run(_names, _feeds)[0]
+        params[0, 0, 5:11] = [0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
+        return [params]
+
+
+def test_generate_integrates_delta_onto_previous_imu():
+    path, sensors, cond = _fused()
+    imu0 = sensors[0]["accel"] + sensors[0]["gyro"]
+    out = generate_sensor_along_path(
+        _ConstDeltaSession(), path, imu0, cond, IDENTITY_NORM, np.random.default_rng(0), temp=0
+    )
+    assert out[0]["accel"] == [0.0, 0.0, 9.8]
+    assert np.allclose(out[1]["accel"], [0.5, 0.0, 9.8])
+    assert np.allclose(out[2]["accel"], [1.0, 0.0, 9.8])
 
 
 def test_decode_temp_interpolates_between_mean_and_sample():

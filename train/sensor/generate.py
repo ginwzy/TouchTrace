@@ -16,7 +16,7 @@ if str(_TRAIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_TRAIN_ROOT))
 
 from sensor.config import model_config
-from sensor.features import IMU_DIMS, pack_sensor_step
+from sensor.features import IMU_DIMS, pack_sensor_step, require_delta_norm
 from touch.features import resolve_jsonl
 
 if TYPE_CHECKING:
@@ -53,7 +53,10 @@ def load_norm(path: str | Path | None = None) -> dict:
     norm_path = Path(path) if path else default_norm_path()
     if not norm_path.exists():
         raise SystemExit(f"Missing {norm_path}")
-    return json.loads(norm_path.read_text())
+    try:
+        return require_delta_norm(json.loads(norm_path.read_text()))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def load_session(model_path: str | Path) -> ort.InferenceSession:
@@ -84,15 +87,20 @@ def mixture_mean(params: np.ndarray) -> np.ndarray:
     return weights @ means
 
 
+def mix_mdn_draw(mean: np.ndarray, sample: np.ndarray, temp: float) -> np.ndarray:
+    if temp <= 0:
+        return mean
+    if temp >= 1:
+        return sample
+    return mean + float(temp) * (sample - mean)
+
+
 def decode_imu_mdn(params: np.ndarray, rng: np.random.Generator, temp: float = 1.0) -> np.ndarray:
     """temp=0 is the mixture mean; temp=1 is a full MDN draw; in between interpolates."""
     center = mixture_mean(params)
     if temp <= 0:
         return center
-    drawn = sample_imu_mdn(params, rng)
-    if temp >= 1:
-        return drawn
-    return center + float(temp) * (drawn - center)
+    return mix_mdn_draw(center, sample_imu_mdn(params, rng), temp)
 
 
 def sensor_mags(sensors: list[dict]) -> tuple[list[float], list[float], list[float]]:
@@ -119,8 +127,10 @@ def generate_sensor_along_path(
 ) -> list[dict]:
     """Roll out accel+gyro on a fixed touch path, starting from imu0.
 
-    temp: 0 = mixture mean, 1 = full MDN sample (default: model_config['mdn_temp']).
-    teacher_sensors: if set, each step is conditioned on the real previous IMU.
+    The ONNX head predicts z-scored ΔIMU; this integrates onto the previous
+    absolute sample. temp: 0 = mixture mean, 1 = full MDN sample
+    (default: model_config['mdn_temp']). teacher_sensors: if set, each step is
+    conditioned on the real previous IMU.
     """
     if len(path) < 2:
         return [_sensor_point(path[0]["timestamp"], imu0)] if path else []
@@ -130,6 +140,8 @@ def generate_sensor_along_path(
     temp = float(model_config["mdn_temp"] if temp is None else temp)
     mean = np.asarray(norm["mean"], dtype=np.float64)
     std = np.asarray(norm["std"], dtype=np.float64)
+    d_mean = np.asarray(norm["delta_mean"], dtype=np.float64)
+    d_std = np.asarray(norm["delta_std"], dtype=np.float64)
     target = path[-1]
     pred = np.asarray(imu0, dtype=np.float64)
     out = [_sensor_point(path[0]["timestamp"], pred.tolist())]
@@ -147,7 +159,8 @@ def generate_sensor_along_path(
         sequence.append(pack_sensor_step(z_prev, prev, curr, target, condition, remaining_frame))
         arr = np.asarray(sequence, dtype=np.float32).reshape(1, len(sequence), INPUT_DIMS)
         params = session.run([output_name], {input_name: arr})[0][0, -1, :PARAMS_SIZE]
-        pred = decode_imu_mdn(params, rng, temp=temp) * std + mean
+        delta = decode_imu_mdn(params, rng, temp=temp) * d_std + d_mean
+        pred = prev_imu + delta
         out.append(_sensor_point(curr["timestamp"], pred.tolist()))
     return out
 
