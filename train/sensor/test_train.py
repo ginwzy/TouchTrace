@@ -1,7 +1,8 @@
 import numpy as np
 
+from sensor.convert import resolve_sensor_weights
 from sensor.generate import mix_mdn_draw
-from sensor.train import mix_scheduled_imu, scheduled_sampling_prob
+from sensor.train import mix_scheduled_imu, scheduled_sampling_prob, ss_schedule_epochs
 
 
 def test_ss_prob_zero_during_warmup():
@@ -18,6 +19,29 @@ def test_ss_prob_ramps_then_caps():
     assert p_mid > p0
     assert abs(p_end - 1.0) < 1e-9
     assert p_late == 1.0
+
+
+def test_ss_schedule_splits_warmup_ramp_hold():
+    assert ss_schedule_epochs(20, 50, 250) == (20, 70, 250)
+    assert ss_schedule_epochs(20, 50, 30) == (20, 30, 30)
+    assert ss_schedule_epochs(20, 50, 20) == (20, 20, 20)
+    assert ss_schedule_epochs(20, 50, 10) == (10, 10, 10)
+
+
+def test_resolve_sensor_weights_prefers_final_over_tf_best(tmp_path):
+    cfg = {"weights": "sensor_model.h5"}
+    best = tmp_path / "sensor_model_best.h5"
+    last = tmp_path / "sensor_model_last.h5"
+    final = tmp_path / "sensor_model.h5"
+    best.write_bytes(b"best")
+    assert resolve_sensor_weights(tmp_path, cfg).name == "sensor_model_best.h5"
+    last.write_bytes(b"last")
+    assert resolve_sensor_weights(tmp_path, cfg).name == "sensor_model_last.h5"
+    final.write_bytes(b"final")
+    assert resolve_sensor_weights(tmp_path, cfg).name == "sensor_model.h5"
+    explicit = tmp_path / "custom.h5"
+    explicit.write_bytes(b"custom")
+    assert resolve_sensor_weights(tmp_path, cfg, weights=explicit) == explicit
 
 
 def test_mix_mdn_draw_interpolates():

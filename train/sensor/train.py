@@ -70,6 +70,14 @@ def scheduled_sampling_prob(epoch: int, warmup: int, ramp: int, ss_max: float) -
     return float(min(ss_max, ss_max * (epoch - warmup + 1) / ramp))
 
 
+def ss_schedule_epochs(warmup: int, ramp: int, total: int) -> tuple[int, int, int]:
+    """Exclusive Keras `epochs=` ends for TF warmup, SS ramp, and p=1 hold."""
+    total = max(total, 0)
+    warmup_end = max(0, min(warmup, total))
+    ramp_end = max(warmup_end, min(warmup_end + max(ramp, 0), total))
+    return warmup_end, ramp_end, total
+
+
 def mix_scheduled_imu(
     x: np.ndarray,
     y: np.ndarray,
@@ -151,7 +159,15 @@ def _write_norm(path: Path, norm: dict, init_by_condition) -> None:
     print(f"Wrote {path}")
 
 
-def _make_callbacks(prefix: Path, *, early_stop: bool, ss_state: dict | None = None):
+def _make_callbacks(
+    prefix: Path,
+    *,
+    monitor: str = "val_loss",
+    save_best: bool = True,
+    early_stop: bool = False,
+    reduce_lr: bool = True,
+    ss_state: dict | None = None,
+):
     import tf_keras
     from tf_keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, TerminateOnNaN
 
@@ -177,34 +193,38 @@ def _make_callbacks(prefix: Path, *, early_stop: bool, ss_state: dict | None = N
                 float(model_config["ss_max"]),
             )
         )
-    callbacks.extend(
-        [
-            ModelCheckpoint(
-                filepath=str(HERE / f"{prefix}_last.h5"),
-                save_weights_only=True,
-                save_freq="epoch",
-                verbose=0,
-            ),
+    callbacks.append(
+        ModelCheckpoint(
+            filepath=str(HERE / f"{prefix}_last.h5"),
+            save_weights_only=True,
+            save_freq="epoch",
+            verbose=0,
+        )
+    )
+    if save_best:
+        callbacks.append(
             ModelCheckpoint(
                 filepath=str(HERE / f"{prefix}_best.h5"),
                 save_weights_only=True,
                 save_best_only=True,
-                monitor="val_loss",
+                monitor=monitor,
                 verbose=1,
-            ),
+            )
+        )
+    if reduce_lr:
+        callbacks.append(
             ReduceLROnPlateau(
-                monitor="val_loss",
+                monitor=monitor,
                 factor=model_config["reduce_lr_factor"],
                 patience=model_config["reduce_lr_patience"],
                 min_lr=model_config["min_lr"],
                 verbose=1,
-            ),
-        ]
-    )
+            )
+        )
     if early_stop:
         callbacks.append(
             EarlyStopping(
-                monitor="val_loss",
+                monitor=monitor,
                 patience=model_config["early_stopping_patience"],
                 restore_best_weights=True,
                 verbose=1,
@@ -239,7 +259,11 @@ def train(
     remaining_frame = bool(model_config.get("remaining_frame", True))
     rng = np.random.default_rng(42)
     ss_max = 0.0 if no_ss else float(model_config["ss_max"])
-    warmup = 0 if ss_max <= 0 else min(int(model_config["ss_warmup_epochs"]), n_epochs)
+    warmup_end, ramp_end, total_epochs = ss_schedule_epochs(
+        int(model_config["ss_warmup_epochs"]),
+        int(model_config["ss_ramp_epochs"]),
+        n_epochs,
+    )
 
     log_train_devices(loader_mode)
     print(
@@ -248,7 +272,7 @@ def train(
     )
     if ss_max > 0:
         print(
-            f"scheduled sampling: warmup={warmup} ramp={model_config['ss_ramp_epochs']} "
+            f"scheduled sampling: warmup={warmup_end} ramp→{ramp_end} hold→{total_epochs} "
             f"max={ss_max} temp={model_config['ss_temp']} (mix sampled ΔIMU into imu_prev)"
         )
     if not data_path.exists():
@@ -313,34 +337,62 @@ def train(
     )
 
     _log_first_batch(train_seq, noise_std, False, "off", remaining_frame)
-    if warmup > 0:
-        print(f"Phase 1 teacher forcing: {warmup} epochs")
+    if ss_max <= 0:
+        print(f"Teacher forcing only: {total_epochs} epochs")
         model.fit(
             train_seq,
-            epochs=warmup,
+            epochs=total_epochs,
             validation_data=val_seq,
-            callbacks=_make_callbacks(prefix, early_stop=False),
+            callbacks=_make_callbacks(prefix, early_stop=True),
         )
-    if warmup < n_epochs:
-        ss_state = {"p": 0.0} if ss_max > 0 else None
-        fit_train = train_seq
-        if ss_state is not None:
-            fit_train = wrap_scheduled_sampling(
+    else:
+        ss_state = {"p": 0.0}
+        if warmup_end > 0:
+            print(f"Phase 1 teacher forcing: {warmup_end} epochs")
+            model.fit(
+                train_seq,
+                epochs=warmup_end,
+                validation_data=val_seq,
+                callbacks=_make_callbacks(prefix, save_best=False),
+            )
+        if warmup_end < total_epochs:
+            ss_train = wrap_scheduled_sampling(
                 train_seq, model, pad, ss_state, rng, norm, float(model_config["ss_temp"])
             )
-            print(f"Phase 2 scheduled sampling: epochs {warmup}→{n_epochs} (val stays teacher-forced)")
-        model.fit(
-            fit_train,
-            epochs=n_epochs,
-            initial_epoch=warmup,
-            validation_data=val_seq,
-            callbacks=_make_callbacks(prefix, early_stop=True, ss_state=ss_state),
-        )
+            if ramp_end > warmup_end:
+                print(f"Phase 2 SS ramp: epochs {warmup_end}→{ramp_end}")
+                model.fit(
+                    ss_train,
+                    epochs=ramp_end,
+                    initial_epoch=warmup_end,
+                    validation_data=val_seq,
+                    callbacks=_make_callbacks(
+                        prefix,
+                        monitor="loss",
+                        save_best=False,
+                        reduce_lr=False,
+                        ss_state=ss_state,
+                    ),
+                )
+            if total_epochs > ramp_end:
+                model.optimizer.learning_rate.assign(float(model_config["learning_rate"]))
+                ss_state["p"] = ss_max
+                print(
+                    f"Phase 3 p=1.0 hold: epochs {ramp_end}→{total_epochs} "
+                    f"(early stop on train loss; lr reset to {model_config['learning_rate']})"
+                )
+                model.fit(
+                    ss_train,
+                    epochs=total_epochs,
+                    initial_epoch=ramp_end,
+                    validation_data=val_seq,
+                    callbacks=_make_callbacks(prefix, monitor="loss", early_stop=True),
+                )
 
     _write_norm(HERE / model_config["norm"], norm, init_by_condition)
     out = HERE / weights_name
     model.save_weights(str(out))
-    print(f"\nTraining complete. Weights: {out}")
+    print(f"\nTraining complete. Export weights: {out} (not TF val_loss best)")
     return out
 
 

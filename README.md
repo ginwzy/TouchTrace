@@ -130,7 +130,7 @@ python -m touch.preview --from-data --raw
 python convert_swipemotiondb.py --sensors   # needs data/raw/CSD4CA/*.csv
 python -m sensor.eval --gen-limit 80 --report   # AR temp sweep vs human; paste the REPORT block
 python -m sensor.preview                    # plots at mdn_temp=0.2; override with --temp
-python -m sensor.train                      # warmup 20 epochs TF, then sampled SS → p=1.0 (ΔIMU)
+python -m sensor.train                      # TF warmup, SS ramp, then p=1.0 hold (export last/hold-best, not TF-best)
 python -m sensor.convert                    # writes sensor.onnx + copies sensor_norm.json
 ```
 

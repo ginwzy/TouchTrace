@@ -16,13 +16,26 @@ from sensor.train import build_sensor_model
 from touch.convert import export_mdn_onnx
 
 
+def resolve_sensor_weights(here: Path, config: dict, lite: bool = False, weights: Path | None = None) -> Path:
+    """Prefer the final saved run, then last, then hold-best."""
+    if weights is not None:
+        return Path(weights)
+    fallback = here / config["weights_lite" if lite else "weights"]
+    last = here / f"{fallback.stem}_last.h5"
+    best = here / f"{fallback.stem}_best.h5"
+    for cand in (fallback, last, best):
+        if cand.exists():
+            return cand
+    return fallback
+
+
 def export_onnx(lite: bool = False, weights: Path | None = None, output: Path | None = None) -> Path:
     return export_mdn_onnx(
         build_model=build_sensor_model,
         config=model_config,
         here=HERE,
         lite=lite,
-        weights=weights,
+        weights=resolve_sensor_weights(HERE, model_config, lite=lite, weights=weights),
         output=output,
         extra_files=(HERE / model_config["norm"],),
     )
