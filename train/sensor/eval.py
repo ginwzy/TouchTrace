@@ -236,7 +236,8 @@ def _print_paste_report(
     print("\n=== SENSOR EVAL REPORT (paste into chat) ===")
     print(
         f"target=delta  mdn_temp={model_config['mdn_temp']}  "
-        f"ss_max={model_config['ss_max']}  ss_temp={model_config['ss_temp']}  n={used}"
+        f"ss_max={model_config['ss_max']}  ss_temp={model_config['ss_temp']}  "
+        f"ss_unroll_hops={model_config.get('ss_unroll_hops', 1)}  n={used}"
     )
     print(f"{'mode':<12} {'cond':<10} {'|a| p50':>8} {'|a| p90':>8} {'|g| p50':>8} {'|da|':>8} {'|dg|':>8} {'last/t0':>8}")
     for label in labels:

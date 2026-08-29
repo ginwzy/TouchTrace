@@ -31,6 +31,7 @@ from sensor.features import (
     abs_z_from_delta_z,
     apply_sensor_norm,
     collect_init_by_condition,
+    delta_z_from_abs_z,
     fit_sensor_norm,
     load_sensor_jsonl,
     load_sensor_sequences,
@@ -85,22 +86,57 @@ def mix_scheduled_imu(
     pad: float,
     prob: float,
     rng: np.random.Generator,
+    use: np.ndarray | None = None,
 ) -> np.ndarray:
     """Replace some next-step imu_prev channels with the model's previous prediction.
 
     X[t, :6] conditions Y[t]. Predictions at t-1 therefore land on X[t, :6].
     """
-    if prob <= 0:
-        return x
-    x_mix = np.array(x, dtype=np.float32, copy=True)
     mask = y[:, :, 0] != pad
-    use = rng.random(mask.shape) < prob
+    if use is None:
+        if prob <= 0:
+            return x
+        use = rng.random(mask.shape) < prob
+    use = np.array(use, dtype=bool, copy=True)
     use[:, 0] = False
     use[:, 1:] &= mask[:, :-1] & mask[:, 1:]
+    if not use.any():
+        return x
+    x_mix = np.array(x, dtype=np.float32, copy=True)
     prev = np.zeros_like(x_mix[..., :6])
     prev[:, 1:] = pred_imu[:, :-1, :6]
     x_mix[..., :6] = np.where(use[..., None], prev, x_mix[..., :6])
     return x_mix
+
+
+def unroll_scheduled_imu(
+    x: np.ndarray,
+    y: np.ndarray,
+    pad: float,
+    prob: float,
+    rng: np.random.Generator,
+    predict_delta_z,
+    norm: dict,
+    hops: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Closed-loop mix for `hops` steps, then retarget Y to human next − mixed prev."""
+    hops = int(hops)
+    if prob <= 0 or hops <= 0:
+        return x, y
+    mask = y[:, :, 0] != pad
+    use = rng.random(mask.shape) < prob
+    use[:, 0] = False
+    use[:, 1:] &= mask[:, :-1] & mask[:, 1:]
+    if not use.any():
+        return x, y
+    human_next_z = abs_z_from_delta_z(x[..., :6], y, norm)
+    x_work = x
+    for _ in range(hops):
+        delta_z = predict_delta_z(x_work)
+        pred_abs_z = abs_z_from_delta_z(x_work[..., :6], delta_z, norm)
+        x_work = mix_scheduled_imu(x_work, y, pred_abs_z, pad, prob, rng, use=use)
+    y_work = np.where(mask[..., None], delta_z_from_abs_z(x_work[..., :6], human_next_z, norm), y)
+    return x_work, y_work.astype(np.float32, copy=False)
 
 
 def wrap_scheduled_sampling(
@@ -111,11 +147,19 @@ def wrap_scheduled_sampling(
     rng: np.random.Generator,
     norm: dict,
     ss_temp: float,
+    hops: int = 1,
 ):
     import tf_keras
 
     def _as_f32(t):
         return np.asarray(t.numpy() if hasattr(t, "numpy") else t, dtype=np.float32)
+
+    def predict_delta_z(x_in):
+        dist = model(x_in, training=False)
+        mean = _as_f32(dist.mean())
+        if ss_temp <= 0:
+            return mean
+        return mix_mdn_draw(mean, _as_f32(dist.sample()), ss_temp)
 
     class ScheduledSamplingSequence(tf_keras.utils.Sequence):
         def __len__(self):
@@ -126,17 +170,10 @@ def wrap_scheduled_sampling(
 
         def __getitem__(self, idx: int):
             x, y, w = inner[idx]
-            p = float(state["p"])
-            if p <= 0:
-                return x, y, w
-            dist = model(x, training=False)
-            mean = _as_f32(dist.mean())
-            if ss_temp <= 0:
-                delta_z = mean
-            else:
-                delta_z = mix_mdn_draw(mean, _as_f32(dist.sample()), ss_temp)
-            pred_abs_z = abs_z_from_delta_z(x[..., :6], delta_z, norm)
-            return mix_scheduled_imu(x, y, pred_abs_z, pad, p, rng), y, w
+            x_mix, y_mix = unroll_scheduled_imu(
+                x, y, pad, float(state["p"]), rng, predict_delta_z, norm, hops
+            )
+            return x_mix, y_mix, w
 
     return ScheduledSamplingSequence()
 
@@ -273,7 +310,8 @@ def train(
     if ss_max > 0:
         print(
             f"scheduled sampling: warmup={warmup_end} ramp→{ramp_end} hold→{total_epochs} "
-            f"max={ss_max} temp={model_config['ss_temp']} (mix sampled ΔIMU into imu_prev)"
+            f"max={ss_max} temp={model_config['ss_temp']} hops={int(model_config['ss_unroll_hops'])} "
+            f"(closed-loop mix; Y retargeted to human next − mixed prev)"
         )
     if not data_path.exists():
         raise SystemExit(f"Missing {data_path}. Run: python convert_swipemotiondb.py --sensors")
@@ -357,7 +395,14 @@ def train(
             )
         if warmup_end < total_epochs:
             ss_train = wrap_scheduled_sampling(
-                train_seq, model, pad, ss_state, rng, norm, float(model_config["ss_temp"])
+                train_seq,
+                model,
+                pad,
+                ss_state,
+                rng,
+                norm,
+                float(model_config["ss_temp"]),
+                hops=int(model_config["ss_unroll_hops"]),
             )
             if ramp_end > warmup_end:
                 print(f"Phase 2 SS ramp: epochs {warmup_end}→{ramp_end}")

@@ -221,6 +221,17 @@ def abs_z_from_delta_z(prev_abs_z: np.ndarray, delta_z: np.ndarray, norm: dict) 
     return ((prev + delta - mean) / std).astype(np.float32)
 
 
+def delta_z_from_abs_z(prev_abs_z: np.ndarray, next_abs_z: np.ndarray, norm: dict) -> np.ndarray:
+    """Z-scored ΔIMU that integrates prev → next in device frame."""
+    mean = np.asarray(norm["mean"], dtype=np.float64)
+    std = np.asarray(norm["std"], dtype=np.float64)
+    d_mean = np.asarray(norm["delta_mean"], dtype=np.float64)
+    d_std = np.asarray(norm["delta_std"], dtype=np.float64)
+    prev = prev_abs_z.astype(np.float64) * std + mean
+    nxt = next_abs_z.astype(np.float64) * std + mean
+    return ((nxt - prev - d_mean) / d_std).astype(np.float32)
+
+
 def require_delta_norm(norm: dict) -> dict:
     if norm.get("target") != "delta" or "delta_mean" not in norm or "delta_std" not in norm:
         raise ValueError(

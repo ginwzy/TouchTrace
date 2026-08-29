@@ -2,7 +2,7 @@ import numpy as np
 
 from sensor.convert import resolve_sensor_weights
 from sensor.generate import mix_mdn_draw
-from sensor.train import mix_scheduled_imu, scheduled_sampling_prob, ss_schedule_epochs
+from sensor.train import mix_scheduled_imu, scheduled_sampling_prob, ss_schedule_epochs, unroll_scheduled_imu
 
 
 def test_ss_prob_zero_during_warmup():
@@ -71,3 +71,52 @@ def test_mix_skips_when_prob_zero():
     pred = np.zeros((2, 4, 6), dtype=np.float32)
     out = mix_scheduled_imu(x, y, pred, pad=-1.0, prob=0.0, rng=np.random.default_rng(0))
     assert out is x
+
+
+def _unit_norm():
+    return {
+        "mean": [0.0] * 6,
+        "std": [1.0] * 6,
+        "delta_mean": [0.0] * 6,
+        "delta_std": [1.0] * 6,
+        "target": "delta",
+    }
+
+
+def test_unroll_zero_hops_is_noop():
+    x = np.ones((1, 3, 13), dtype=np.float32)
+    y = np.zeros((1, 3, 6), dtype=np.float32)
+    out_x, out_y = unroll_scheduled_imu(
+        x, y, pad=-999.0, prob=1.0, rng=np.random.default_rng(0),
+        predict_delta_z=lambda _x: np.zeros_like(y),
+        norm=_unit_norm(), hops=0,
+    )
+    assert out_x is x
+    assert out_y is y
+
+
+def test_unroll_compounds_zero_delta_across_hops():
+    x = np.zeros((1, 3, 13), dtype=np.float32)
+    x[0, :, :6] = np.array([[1.0] * 6, [2.0] * 6, [3.0] * 6], dtype=np.float32)
+    y = np.ones((1, 3, 6), dtype=np.float32)
+    rng = np.random.default_rng(0)
+
+    def predict_zero(_x):
+        return np.zeros_like(y)
+
+    x1, _ = unroll_scheduled_imu(
+        x, y, pad=-999.0, prob=1.0, rng=rng, predict_delta_z=predict_zero, norm=_unit_norm(), hops=1,
+    )
+    assert np.allclose(x1[0, 0, :6], 1.0)
+    assert np.allclose(x1[0, 1, :6], 1.0)
+    assert np.allclose(x1[0, 2, :6], 2.0)
+
+    x2, y2 = unroll_scheduled_imu(
+        x, y, pad=-999.0, prob=1.0, rng=np.random.default_rng(0),
+        predict_delta_z=predict_zero, norm=_unit_norm(), hops=2,
+    )
+    assert np.allclose(x2[0, :, :6], 1.0)
+    # orig next = prev + 1; after two hops imu_prev is 1 everywhere except it is 1 at t=0 too.
+    assert np.allclose(y2[0, 0], 1.0)
+    assert np.allclose(y2[0, 1], 2.0)
+    assert np.allclose(y2[0, 2], 3.0)

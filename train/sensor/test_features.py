@@ -8,6 +8,7 @@ import numpy as np
 from sensor.features import (
     abs_z_from_delta_z,
     apply_sensor_norm,
+    delta_z_from_abs_z,
     collect_init_by_condition,
     condition_onehot,
     encode_sensor_trajectory,
@@ -102,6 +103,7 @@ def test_abs_z_from_delta_z_integrates_in_device_frame():
     got = abs_z_from_delta_z(prev_z, delta_z, norm)
     # next abs ax = 0 + 1 = 1 → z = (1-0)/2 = 0.5
     assert np.allclose(got, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0])
+    assert np.allclose(delta_z_from_abs_z(prev_z, got, norm), delta_z)
 
 
 def test_require_delta_norm_rejects_absolute_stats():
