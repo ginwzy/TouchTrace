@@ -103,6 +103,25 @@ def decode_imu_mdn(params: np.ndarray, rng: np.random.Generator, temp: float = 1
     return mix_mdn_draw(center, sample_imu_mdn(params, rng), temp)
 
 
+def decode_correlated_imu_mdn(
+    params: np.ndarray,
+    rng: np.random.Generator,
+    temp: float,
+    rho: float,
+    previous_innovation: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Decode an MDN draw while optionally correlating only its innovation."""
+    if not 0.0 <= rho < 1.0:
+        raise ValueError("innovation_rho must be in [0, 1)")
+    center = mixture_mean(params)
+    if temp <= 0:
+        return center, previous_innovation
+    innovation = sample_imu_mdn(params, rng) - center
+    if rho > 0 and previous_innovation is not None:
+        innovation = rho * previous_innovation + math.sqrt(1.0 - rho * rho) * innovation
+    return center + float(temp) * innovation, innovation
+
+
 def sensor_mags(sensors: list[dict]) -> tuple[list[float], list[float], list[float]]:
     ts, acc, gyro = [], [], []
     for s in sensors:
@@ -124,13 +143,15 @@ def generate_sensor_along_path(
     *,
     temp: float | None = None,
     teacher_sensors: list[dict] | None = None,
+    innovation_rho: float = 0.0,
 ) -> list[dict]:
     """Roll out accel+gyro on a fixed touch path, starting from imu0.
 
     The ONNX head predicts z-scored ΔIMU; this integrates onto the previous
     absolute sample. temp: 0 = mixture mean, 1 = full MDN sample
-    (default: model_config['mdn_temp']). teacher_sensors: if set, each step is
-    conditioned on the real previous IMU.
+    (default: model_config['mdn_temp']). innovation_rho correlates only the
+    stochastic MDN residual; 0 preserves independent per-step draws.
+    teacher_sensors: if set, each step is conditioned on the real previous IMU.
     """
     if len(path) < 2:
         return [_sensor_point(path[0]["timestamp"], imu0)] if path else []
@@ -138,6 +159,9 @@ def generate_sensor_along_path(
         raise ValueError("teacher_sensors must align with path")
     remaining_frame = model_config["remaining_frame"] if remaining_frame is None else remaining_frame
     temp = float(model_config["mdn_temp"] if temp is None else temp)
+    innovation_rho = float(innovation_rho)
+    if not 0.0 <= innovation_rho < 1.0:
+        raise ValueError("innovation_rho must be in [0, 1)")
     mean = np.asarray(norm["mean"], dtype=np.float64)
     std = np.asarray(norm["std"], dtype=np.float64)
     d_mean = np.asarray(norm["delta_mean"], dtype=np.float64)
@@ -148,6 +172,7 @@ def generate_sensor_along_path(
     sequence: list[list[float]] = []
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
+    innovation = None
 
     for i, (prev, curr) in enumerate(zip(path, path[1:])):
         if teacher_sensors is not None:
@@ -159,7 +184,14 @@ def generate_sensor_along_path(
         sequence.append(pack_sensor_step(z_prev, prev, curr, target, condition, remaining_frame))
         arr = np.asarray(sequence, dtype=np.float32).reshape(1, len(sequence), INPUT_DIMS)
         params = session.run([output_name], {input_name: arr})[0][0, -1, :PARAMS_SIZE]
-        delta = decode_imu_mdn(params, rng, temp=temp) * d_std + d_mean
+        delta_z, innovation = decode_correlated_imu_mdn(
+            params,
+            rng,
+            temp,
+            innovation_rho,
+            innovation,
+        )
+        delta = delta_z * d_std + d_mean
         pred = prev_imu + delta
         out.append(_sensor_point(curr["timestamp"], pred.tolist()))
     return out

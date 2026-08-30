@@ -29,7 +29,15 @@ def resolve_sensor_weights(here: Path, config: dict, lite: bool = False, weights
     return fallback
 
 
-def export_onnx(lite: bool = False, weights: Path | None = None, output: Path | None = None) -> Path:
+def export_onnx(
+    lite: bool = False,
+    weights: Path | None = None,
+    output: Path | None = None,
+    norm: Path | None = None,
+    *,
+    publish: bool = True,
+) -> Path:
+    norm_path = Path(norm) if norm is not None else HERE / model_config["norm"]
     return export_mdn_onnx(
         build_model=build_sensor_model,
         config=model_config,
@@ -37,7 +45,8 @@ def export_onnx(lite: bool = False, weights: Path | None = None, output: Path | 
         lite=lite,
         weights=resolve_sensor_weights(HERE, model_config, lite=lite, weights=weights),
         output=output,
-        extra_files=(HERE / model_config["norm"],),
+        extra_files=(norm_path,),
+        publish=publish,
     )
 
 
@@ -46,8 +55,25 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--lite", action="store_true")
     parser.add_argument("--weights", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--norm",
+        type=Path,
+        default=None,
+        help="Normalization file paired with the selected weights",
+    )
+    parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Keep the ONNX output isolated instead of copying release assets",
+    )
     args = parser.parse_args(argv)
-    export_onnx(lite=args.lite, weights=args.weights, output=args.output)
+    export_onnx(
+        lite=args.lite,
+        weights=args.weights,
+        output=args.output,
+        norm=args.norm,
+        publish=not args.no_publish,
+    )
 
 
 if __name__ == "__main__":

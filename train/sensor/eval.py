@@ -26,6 +26,7 @@ from sensor.generate import (
     load_session,
     sensor_mags,
 )
+from sensor.split import load_user_split, rows_for_partition
 from touch.features import iter_jsonl
 
 
@@ -47,14 +48,38 @@ def val_rows(
     val_fraction: float,
     seed: int = 42,
     limit: int | None = None,
+    stratified: bool = True,
 ) -> list[dict]:
     if not rows:
         return []
     order = np.random.default_rng(seed).permutation(len(rows))
     n_val = max(1, int(len(rows) * val_fraction))
-    picked = [rows[int(i)] for i in order[:n_val]]
-    if limit is not None:
-        picked = picked[:limit]
+    pool = [rows[int(i)] for i in order[:n_val]]
+    if limit is None or limit >= len(pool):
+        return pool
+    if not stratified:
+        return pool[:limit]
+
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for row in pool:
+        condition = str((row.get("meta") or {}).get("condition") or "unknown")
+        buckets[condition].append(row)
+    keys = [condition for condition in CONDITIONS if buckets.get(condition)]
+    keys.extend(sorted(condition for condition in buckets if condition not in CONDITIONS))
+    picked: list[dict] = []
+    cursor = 0
+    while len(picked) < limit:
+        added = False
+        for condition in keys:
+            bucket = buckets[condition]
+            if cursor < len(bucket):
+                picked.append(bucket[cursor])
+                added = True
+                if len(picked) == limit:
+                    break
+        if not added:
+            break
+        cursor += 1
     return picked
 
 
@@ -132,46 +157,120 @@ def _vec_err(real: list[dict], gen: list[dict]) -> tuple[list[float], list[float
     return acc_err, gyro_err
 
 
-def _mode_name(temp: float, teacher: bool) -> str:
+def _step_change_summary(sensors: list[dict]) -> tuple[float, float]:
+    """Swipe-level median vector change, so long swipes do not dominate."""
+    dacc: list[float] = []
+    dgyro: list[float] = []
+    for prev, curr in zip(sensors, sensors[1:]):
+        pa, ca = prev["accel"], curr["accel"]
+        pg, cg = prev["gyro"], curr["gyro"]
+        dacc.append(math.hypot(ca[0] - pa[0], ca[1] - pa[1], ca[2] - pa[2]))
+        dgyro.append(math.hypot(cg[0] - pg[0], cg[1] - pg[1], cg[2] - pg[2]))
+    if not dacc:
+        return float("nan"), float("nan")
+    return float(np.median(dacc)), float(np.median(dgyro))
+
+
+def _print_step_change_table(labels, activity) -> None:
+    print("\ntemporal vector change (swipe-weighted median)")
+    print(f"{'mode':<12} {'cond':<10} {'|delta a|':>10} {'|delta g|':>10}")
+    for label in labels:
+        for condition in CONDITIONS:
+            dacc = sorted(activity[label][condition]["acc"])
+            dgyro = sorted(activity[label][condition]["gyro"])
+            if not dacc:
+                continue
+            print(
+                f"{label:<12} {condition:<10} "
+                f"{_pct(dacc, 50):>10.4f} {_pct(dgyro, 50):>10.5f}"
+            )
+
+
+def _mode_name(temp: float, teacher: bool, innovation_rho: float = 0.0) -> str:
     prefix = "tf" if teacher else "ar"
     if temp <= 0:
-        return f"{prefix}-mean"
-    if temp >= 1:
-        return f"{prefix}-sample"
-    return f"{prefix}-t{temp:g}"
+        base = f"{prefix}-mean"
+    elif temp >= 1:
+        base = f"{prefix}-sample"
+    else:
+        base = f"{prefix}-t{temp:g}"
+    if not teacher and temp > 0 and innovation_rho > 0:
+        base += f"-r{innovation_rho:g}"
+    return base
 
 
-def compare_generated(
+def _lag_correlation(values: np.ndarray, lag: int) -> float:
+    if len(values) <= lag:
+        return float("nan")
+    centered = values - values.mean(axis=0, keepdims=True)
+    left = centered[:-lag]
+    right = centered[lag:]
+    denom = float(np.linalg.norm(left) * np.linalg.norm(right))
+    if denom <= 1e-12:
+        return float("nan")
+    return float(np.sum(left * right) / denom)
+
+
+def _gyro_persistence_summary(sensors: list[dict]) -> dict[str, float]:
+    gyro = np.asarray([sample["gyro"] for sample in sensors], dtype=np.float64)
+    if len(gyro) == 0:
+        return {"mean": float("nan"), "residual": float("nan"), "lag1": float("nan"), "lag4": float("nan")}
+    center = gyro.mean(axis=0)
+    residual = np.linalg.norm(gyro - center, axis=1)
+    return {
+        "mean": float(np.linalg.norm(center)),
+        "residual": float(np.median(residual)),
+        "lag1": _lag_correlation(gyro, 1),
+        "lag4": _lag_correlation(gyro, 4),
+    }
+
+
+def collect_generated(
     rows: list[dict],
     session,
     norm: dict,
     *,
     limit: int = 200,
     seed: int = 42,
-    temps: tuple[float, ...] = (0.0, 0.2, 0.3, 0.5, 1.0),
-    report: bool = False,
-) -> None:
-    val = val_rows(rows, model_config["validation_split"], seed=seed, limit=limit)
+    temps: tuple[float, ...] = (0.0, 0.2, 0.3, 0.4, 0.5, 1.0),
+    innovation_rhos: tuple[float, ...] = (0.0,),
+    selected_rows: list[dict] | None = None,
+) -> dict:
+    source = rows if selected_rows is None else selected_rows
+    fraction = model_config["validation_split"] if selected_rows is None else 1.0
+    val = val_rows(source, fraction, seed=seed, limit=limit)
     step_px = float(model_config["min_step_px"])
-    modes = [(_mode_name(t, False), t, False) for t in temps]
-    modes.append((_mode_name(0.0, True), 0.0, True))
-    labels = ("real",) + tuple(name for name, _, _ in modes)
+    modes = [
+        (_mode_name(t, False, rho), t, False, rho)
+        for t in temps
+        for rho in innovation_rhos
+        if t > 0 or rho == 0
+    ]
+    modes.append((_mode_name(0.0, True), 0.0, True, 0.0))
+    labels = ("real",) + tuple(name for name, *_ in modes)
     buckets = {label: {c: {"acc": [], "gyro": []} for c in CONDITIONS} for label in labels}
     n = {label: defaultdict(int) for label in labels}
     first = {label: defaultdict(list) for label in labels}
     last_a = {label: defaultdict(list) for label in labels}
-    err = {name: {c: {"acc": [], "gyro": []} for c in CONDITIONS} for name, _, _ in modes}
+    err = {name: {c: {"acc": [], "gyro": []} for c in CONDITIONS} for name, *_ in modes}
+    activity = {label: {c: {"acc": [], "gyro": []} for c in CONDITIONS} for label in labels}
+    persistence = {
+        label: {c: {"mean": [], "residual": [], "lag1": [], "lag4": []} for c in CONDITIONS}
+        for label in labels
+    }
     used = 0
     for i, row in enumerate(val):
         cond = str((row.get("meta") or {}).get("condition") or "")
         if cond not in CONDITIONS:
             continue
-        path, sensors = subsample_paired(row.get("path") or [], row.get("sensors") or [], min_step_px=step_px)
+        path, sensors = subsample_paired(
+            row.get("path") or [], row.get("sensors") or [], min_step_px=step_px
+        )
         if len(path) < 2 or len(path) != len(sensors):
             continue
         imu0 = sensors[0]["accel"] + sensors[0]["gyro"]
         seqs = {"real": sensors}
-        for name, temp, teacher in modes:
+        for name, temp, teacher, rho in modes:
             seqs[name] = generate_sensor_along_path(
                 session,
                 path,
@@ -181,6 +280,7 @@ def compare_generated(
                 np.random.default_rng(seed + i),
                 temp=temp,
                 teacher_sensors=sensors if teacher else None,
+                innovation_rho=rho,
             )
         for label, seq in seqs.items():
             _, acc, gyro = sensor_mags(seq)
@@ -189,16 +289,19 @@ def compare_generated(
             n[label][cond] += 1
             first[label][cond].append(acc[0])
             last_a[label][cond].append(acc[-1])
-        for name, _, _ in modes:
+            dacc, dgyro = _step_change_summary(seq)
+            if math.isfinite(dacc):
+                activity[label][cond]["acc"].append(dacc)
+                activity[label][cond]["gyro"].append(dgyro)
+            for key, value in _gyro_persistence_summary(seq).items():
+                if math.isfinite(value):
+                    persistence[label][cond][key].append(value)
+        for name, *_ in modes:
             ae, ge = _vec_err(sensors, seqs[name])
             err[name][cond]["acc"].extend(ae)
             err[name][cond]["gyro"].extend(ge)
         used += 1
-    print(
-        f"\nGenerated vs human on {used} validation swipes "
-        f"(frozen touch path, min_step_px={step_px})"
-    )
-    print("ar = autoregressive; tf = teacher-forced; t* = MDN temp (0=mean, 1=full sample)")
+
     extras: dict[str, dict] = {}
     for label in labels:
         extra = {}
@@ -211,19 +314,169 @@ def compare_generated(
             mean_t0 = sum(t0) / len(t0)
             extra[cond] = {"last_a": mean_last, "drift": mean_last / max(mean_t0, 1e-6)}
         extras[label] = extra
+    return {
+        "used": used,
+        "labels": labels,
+        "modes": modes,
+        "n": n,
+        "buckets": buckets,
+        "first": first,
+        "err": err,
+        "activity": activity,
+        "persistence": persistence,
+        "extras": extras,
+        "step_px": step_px,
+    }
+
+
+def rollout_summary(stats: dict) -> dict[str, dict[str, dict[str, float]]]:
+    out: dict[str, dict[str, dict[str, float]]] = {}
+    for label in stats["labels"]:
+        by_condition: dict[str, dict[str, float]] = {}
+        for cond in CONDITIONS:
+            acc = sorted(stats["buckets"][label][cond]["acc"])
+            gyro = sorted(stats["buckets"][label][cond]["gyro"])
+            if not acc:
+                continue
+            activity = stats["activity"][label][cond]
+            persistence = stats["persistence"][label][cond]
+            errors = stats["err"].get(label, {}).get(cond, {})
+            acc_err = sorted(errors.get("acc") or [])
+            gyro_err = sorted(errors.get("gyro") or [])
+            by_condition[cond] = {
+                "n": int(stats["n"][label][cond]),
+                "acc_p50": _pct(acc, 50),
+                "acc_p90": _pct(acc, 90),
+                "gyro_p50": _pct(gyro, 50),
+                "gyro_mean": sum(gyro) / len(gyro),
+                "delta_acc": _pct(sorted(activity["acc"]), 50),
+                "delta_gyro": _pct(sorted(activity["gyro"]), 50),
+                "gyro_swipe_mean": _pct(sorted(persistence["mean"]), 50),
+                "gyro_residual": _pct(sorted(persistence["residual"]), 50),
+                "gyro_lag1": _pct(sorted(persistence["lag1"]), 50),
+                "gyro_lag4": _pct(sorted(persistence["lag4"]), 50),
+                "point_acc": _pct(acc_err, 50) if acc_err else float("nan"),
+                "point_gyro": _pct(gyro_err, 50) if gyro_err else float("nan"),
+                "drift": stats["extras"].get(label, {}).get(cond, {}).get("drift", float("nan")),
+            }
+        out[label] = by_condition
+    return out
+
+
+def distribution_score(
+    summary: dict[str, dict[str, dict[str, float]]],
+    label: str,
+    reference: str = "real",
+) -> float:
+    ratio_weights = {
+        "acc_p90": 1.0,
+        "gyro_p50": 2.0,
+        "delta_acc": 1.0,
+        "delta_gyro": 1.0,
+        "gyro_swipe_mean": 2.0,
+        "gyro_residual": 1.0,
+        "drift": 1.0,
+    }
+    correlation_weights = {"gyro_lag1": 0.5, "gyro_lag4": 0.5}
+    weighted_error = 0.0
+    total_weight = 0.0
+    for cond in CONDITIONS:
+        actual = summary.get(label, {}).get(cond)
+        expected = summary.get(reference, {}).get(cond)
+        if not actual or not expected:
+            continue
+        for key, weight in ratio_weights.items():
+            got = float(actual.get(key, float("nan")))
+            want = float(expected.get(key, float("nan")))
+            if math.isfinite(got) and math.isfinite(want) and got > 0 and want > 0:
+                weighted_error += weight * abs(math.log(got / want))
+                total_weight += weight
+        for key, weight in correlation_weights.items():
+            got = float(actual.get(key, float("nan")))
+            want = float(expected.get(key, float("nan")))
+            if math.isfinite(got) and math.isfinite(want):
+                weighted_error += weight * abs(got - want)
+                total_weight += weight
+    return weighted_error / total_weight if total_weight else float("inf")
+
+
+def _print_persistence_table(labels, persistence) -> None:
+    print("\ngyro persistence (swipe-weighted median)")
+    print(f"{'mode':<12} {'cond':<10} {'|mean g|':>10} {'|g-mean|':>10} {'lag1':>8} {'lag4':>8}")
+    for label in labels:
+        for cond in CONDITIONS:
+            values = persistence[label][cond]
+            means = sorted(values["mean"])
+            if not means:
+                continue
+            print(
+                f"{label:<12} {cond:<10} {_pct(means, 50):>10.4f} "
+                f"{_pct(sorted(values['residual']), 50):>10.4f} "
+                f"{_pct(sorted(values['lag1']), 50):>8.3f} "
+                f"{_pct(sorted(values['lag4']), 50):>8.3f}"
+            )
+
+
+def compare_generated(
+    rows: list[dict],
+    session,
+    norm: dict,
+    *,
+    limit: int = 200,
+    seed: int = 42,
+    temps: tuple[float, ...] = (0.0, 0.2, 0.3, 0.4, 0.5, 1.0),
+    innovation_rhos: tuple[float, ...] = (0.0,),
+    report: bool = False,
+    selected_rows: list[dict] | None = None,
+) -> dict[str, dict[str, dict[str, float]]]:
+    stats = collect_generated(
+        rows,
+        session,
+        norm,
+        limit=limit,
+        seed=seed,
+        temps=temps,
+        innovation_rhos=innovation_rhos,
+        selected_rows=selected_rows,
+    )
+    print(
+        f"\nGenerated vs human on {stats['used']} stratified validation swipes "
+        f"(frozen touch path, min_step_px={stats['step_px']})"
+    )
+    print("ar = autoregressive; tf = teacher-forced; t* = MDN temp; r* = innovation rho")
+    for label in stats["labels"]:
         print(label)
-        _print_mag_table(n[label], buckets[label], first[label], extra)
+        _print_mag_table(
+            stats["n"][label],
+            stats["buckets"][label],
+            stats["first"][label],
+            stats["extras"][label],
+        )
     print("\npointwise |gen-human| after t0 (median)")
     print(f"{'mode':<12} {'cond':<10} {'|da| p50':>10} {'|dg| p50':>10}")
-    for name, _, _ in modes:
+    for name, *_ in stats["modes"]:
         for cond in CONDITIONS:
-            ae = sorted(err[name][cond]["acc"])
-            ge = sorted(err[name][cond]["gyro"])
-            if not ae:
-                continue
-            print(f"{name:<12} {cond:<10} {_pct(ae, 50):>10.3f} {_pct(ge, 50):>10.4f}")
+            ae = sorted(stats["err"][name][cond]["acc"])
+            ge = sorted(stats["err"][name][cond]["gyro"])
+            if ae:
+                print(f"{name:<12} {cond:<10} {_pct(ae, 50):>10.3f} {_pct(ge, 50):>10.4f}")
+    _print_step_change_table(stats["labels"], stats["activity"])
+    _print_persistence_table(stats["labels"], stats["persistence"])
+    if stats["used"] < 300:
+        print(
+            f"\nWARNING: n={stats['used']} is diagnostic only; "
+            "use --gen-limit 500 or more for model selection."
+        )
     if report:
-        _print_paste_report(used, labels, buckets, err, extras)
+        _print_paste_report(
+            stats["used"],
+            stats["labels"],
+            stats["buckets"],
+            stats["err"],
+            stats["extras"],
+            stats["activity"],
+        )
+    return rollout_summary(stats)
 
 
 def _print_paste_report(
@@ -232,14 +485,19 @@ def _print_paste_report(
     buckets: dict,
     err: dict,
     extras: dict,
+    activity: dict,
 ) -> None:
     print("\n=== SENSOR EVAL REPORT (paste into chat) ===")
     print(
         f"target=delta  mdn_temp={model_config['mdn_temp']}  "
         f"ss_max={model_config['ss_max']}  ss_temp={model_config['ss_temp']}  "
-        f"ss_unroll_hops={model_config.get('ss_unroll_hops', 1)}  n={used}"
+        f"ss_unroll_hops={model_config.get('ss_unroll_hops', 1)}  "
+        f"ss_target_clip_z={model_config.get('ss_target_clip_z', 0)}  n={used}"
     )
-    print(f"{'mode':<12} {'cond':<10} {'|a| p50':>8} {'|a| p90':>8} {'|g| p50':>8} {'|da|':>8} {'|dg|':>8} {'last/t0':>8}")
+    print(
+        f"{'mode':<12} {'cond':<10} {'|a| p50':>8} {'|a| p90':>8} "
+        f"{'|g| p50':>8} {'|da|':>8} {'|dg|':>8} {'last/t0':>8}"
+    )
     for label in labels:
         extra = extras.get(label) or {}
         for cond in CONDITIONS:
@@ -259,6 +517,17 @@ def _print_paste_report(
                 f"{_pct(gyro, 50):>8.4f} {da:>8.3f} {dg:>8.4f} {drift:>8.2f}"
             )
     print("Watch: AR |dg| vs tf-mean |dg| (should close); walking |a| p90 vs real.")
+    print("swipe-weighted temporal vector change")
+    print(f"{'mode':<12} {'cond':<10} {'|delta a|':>10} {'|delta g|':>10}")
+    for label in labels:
+        for cond in CONDITIONS:
+            dacc = sorted(activity[label][cond]["acc"])
+            dgyro = sorted(activity[label][cond]["gyro"])
+            if dacc:
+                print(
+                    f"{label:<12} {cond:<10} "
+                    f"{_pct(dacc, 50):>10.4f} {_pct(dgyro, 50):>10.5f}"
+                )
     print("=== END REPORT ===")
 
 
@@ -268,11 +537,23 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--limit", type=int, default=None, help="Cap jsonl rows loaded (debug)")
     parser.add_argument("--model", type=Path, default=None)
     parser.add_argument("--norm", type=Path, default=None)
+    parser.add_argument("--split-manifest", type=Path, default=None)
+    parser.add_argument(
+        "--partition",
+        choices=("train", "validation", "test"),
+        default=None,
+        help="Evaluate one user-grouped partition from the split manifest",
+    )
     parser.add_argument("--gen-limit", type=int, default=200, help="Validation swipes to roll out")
     parser.add_argument(
         "--temps",
         default=None,
         help="Comma-separated MDN temps for autoregressive compare (0=mean, 1=full sample)",
+    )
+    parser.add_argument(
+        "--rhos",
+        default="0",
+        help="Comma-separated innovation correlations in [0,1); 0 preserves independent draws",
     )
     parser.add_argument("--skip-gen", action="store_true", help="Human baseline only")
     parser.add_argument(
@@ -285,7 +566,14 @@ def main(argv: list[str] | None = None) -> None:
     if not path.exists():
         raise SystemExit(f"Missing {path}")
     rows = load_fused(path, limit=args.limit)
-    summarize(rows)
+    selected_rows = None
+    if args.partition:
+        split_path = args.split_manifest or HERE / model_config["split_manifest"]
+        if not split_path.exists():
+            raise SystemExit(f"Missing split manifest {split_path}")
+        selected_rows = rows_for_partition(rows, load_user_split(split_path), args.partition)
+        print(f"User-grouped {args.partition} partition: {len(selected_rows)} rows")
+    summarize(selected_rows if selected_rows is not None else rows)
     if args.skip_gen:
         return
     model = args.model or default_onnx_path()
@@ -296,14 +584,17 @@ def main(argv: list[str] | None = None) -> None:
         temps = tuple(float(x) for x in args.temps.split(",") if x.strip() != "")
     else:
         t = float(model_config["mdn_temp"])
-        temps = (0.0, t, 0.5, 1.0)
+        temps = tuple(dict.fromkeys((0.0, t, 0.3, 0.4, 0.5, 1.0)))
+    innovation_rhos = tuple(float(x) for x in args.rhos.split(",") if x.strip() != "")
     compare_generated(
         rows,
         load_session(model),
         load_norm(args.norm or default_norm_path()),
         limit=args.gen_limit,
         temps=temps,
+        innovation_rhos=innovation_rhos,
         report=args.report,
+        selected_rows=selected_rows,
     )
 
 

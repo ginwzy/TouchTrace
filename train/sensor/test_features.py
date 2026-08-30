@@ -14,6 +14,7 @@ from sensor.features import (
     encode_sensor_trajectory,
     fit_sensor_norm,
     load_sensor_jsonl,
+    load_sensor_jsonl_grouped,
     require_delta_norm,
     subsample_paired,
 )
@@ -69,13 +70,17 @@ def test_load_sensor_jsonl_and_zscore(tmp_path: Path):
     path, sensors, cond = _fused()
     rec = {
         "target": {"x": 0.0, "y": 40.0},
-        "meta": {"condition": cond},
+        "meta": {"condition": cond, "user_id": "user-a"},
         "path": path,
         "sensors": sensors,
     }
     jsonl = tmp_path / "touch_sensor_data.jsonl"
     jsonl.write_text(json.dumps(rec) + "\n")
     X, Y = load_sensor_jsonl(jsonl, pad=-999.0, min_step_px=0.0)
+    grouped_x, grouped_y, users = load_sensor_jsonl_grouped(jsonl, pad=-999.0, min_step_px=0.0)
+    assert np.array_equal(grouped_x, X)
+    assert np.array_equal(grouped_y, Y)
+    assert users == ["user-a"]
     assert X.shape[-1] == 13
     assert Y.shape[-1] == 6
     assert Y.shape[0] == 1
@@ -87,6 +92,7 @@ def test_load_sensor_jsonl_and_zscore(tmp_path: Path):
     inits = collect_init_by_condition(jsonl)
     assert "walking" in inits
     assert abs(inits["walking"]["mean"][2] - 9.8) < 1e-6
+    assert collect_init_by_condition(jsonl, allowed_users={"other"}) == {}
 
 
 def test_abs_z_from_delta_z_integrates_in_device_frame():

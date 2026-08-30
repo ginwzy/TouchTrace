@@ -1,7 +1,15 @@
 import numpy as np
+import pytest
 
 from sensor.features import encode_sensor_trajectory, pack_sensor_step
-from sensor.generate import PARAMS_SIZE, decode_imu_mdn, generate_sensor_along_path, mixture_mean, sample_imu_mdn
+from sensor.generate import (
+    PARAMS_SIZE,
+    decode_correlated_imu_mdn,
+    decode_imu_mdn,
+    generate_sensor_along_path,
+    mixture_mean,
+    sample_imu_mdn,
+)
 from sensor.test_features import _fused
 
 
@@ -124,6 +132,53 @@ def test_generate_integrates_delta_onto_previous_imu():
     assert out[0]["accel"] == [0.0, 0.0, 9.8]
     assert np.allclose(out[1]["accel"], [0.5, 0.0, 9.8])
     assert np.allclose(out[2]["accel"], [1.0, 0.0, 9.8])
+
+
+def test_correlated_decode_preserves_first_draw_and_filters_next_innovation():
+    params = np.zeros(PARAMS_SIZE, dtype=np.float64)
+    params[0] = 8.0
+    center = mixture_mean(params)
+    raw_rng = np.random.default_rng(9)
+    raw_first = sample_imu_mdn(params, raw_rng) - center
+    raw_second = sample_imu_mdn(params, raw_rng) - center
+
+    correlated_rng = np.random.default_rng(9)
+    first, state = decode_correlated_imu_mdn(params, correlated_rng, 0.3, 0.7, None)
+    second, next_state = decode_correlated_imu_mdn(params, correlated_rng, 0.3, 0.7, state)
+
+    assert np.allclose(first, center + 0.3 * raw_first)
+    expected = 0.7 * raw_first + np.sqrt(1.0 - 0.7**2) * raw_second
+    assert np.allclose(next_state, expected)
+    assert np.allclose(second, center + 0.3 * expected)
+
+
+def test_zero_rho_matches_existing_decode():
+    params = np.zeros(PARAMS_SIZE, dtype=np.float64)
+    params[0] = 8.0
+    direct = decode_imu_mdn(params, np.random.default_rng(11), temp=0.3)
+    correlated, _ = decode_correlated_imu_mdn(
+        params,
+        np.random.default_rng(11),
+        temp=0.3,
+        rho=0.0,
+        previous_innovation=np.ones(6),
+    )
+    assert np.array_equal(correlated, direct)
+
+
+def test_generate_rejects_invalid_innovation_rho():
+    path, sensors, cond = _fused()
+    imu0 = sensors[0]["accel"] + sensors[0]["gyro"]
+    with pytest.raises(ValueError, match="innovation_rho"):
+        generate_sensor_along_path(
+            _DeltaSession(),
+            path,
+            imu0,
+            cond,
+            IDENTITY_NORM,
+            np.random.default_rng(0),
+            innovation_rho=1.0,
+        )
 
 
 def test_decode_temp_interpolates_between_mean_and_sample():

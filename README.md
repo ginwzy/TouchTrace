@@ -128,10 +128,11 @@ python -m touch.preview --from-data --raw
 
 # Sensor model (training data is train/sensor/sensor_data.jsonl.gz)
 python convert_swipemotiondb.py --sensors   # needs data/raw/CSD4CA/*.csv
-python -m sensor.eval --gen-limit 80 --report   # AR temp sweep vs human; paste the REPORT block
+python -m sensor.eval --gen-limit 500 --report  # stratified AR temp/rho sweep + temporal dynamics
 python -m sensor.preview                    # plots at mdn_temp=0.2; override with --temp
-python -m sensor.train                      # TF warmup, SS ramp (K-step unroll), p=1.0 hold
-python -m sensor.convert                    # writes sensor.onnx + copies sensor_norm.json
+python -m sensor.train --run-name sensor-correction --ss-target-mode correction
+python -m sensor.sweep --help               # offline grouped-validation checkpoint selection
+python -m sensor.convert --weights candidate.h5 --norm candidate_norm.json --no-publish
 ```
 
 **Google Colab (GPU):**

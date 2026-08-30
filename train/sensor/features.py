@@ -81,12 +81,12 @@ def encode_sensor_trajectory(
     return X, Y
 
 
-def iter_encoded_sensor_trajectories(
+def iter_encoded_sensor_records(
     filepath: str | Path,
     max_steps: int | None = DEFAULT_MAX_STEPS,
     min_step_px: float = 0.0,
     remaining_frame: bool = True,
-) -> Iterator[tuple[list[list[float]], list[list[float]]]]:
+) -> Iterator[tuple[list[list[float]], list[list[float]], dict]]:
     for data in iter_jsonl(filepath):
         path = data.get("path") or []
         sensors = data.get("sensors") or []
@@ -107,6 +107,21 @@ def iter_encoded_sensor_trajectories(
             y_seq = y_seq[:max_steps]
         if not x_seq:
             continue
+        yield x_seq, y_seq, dict(data.get("meta") or {})
+
+
+def iter_encoded_sensor_trajectories(
+    filepath: str | Path,
+    max_steps: int | None = DEFAULT_MAX_STEPS,
+    min_step_px: float = 0.0,
+    remaining_frame: bool = True,
+) -> Iterator[tuple[list[list[float]], list[list[float]]]]:
+    for x_seq, y_seq, _ in iter_encoded_sensor_records(
+        filepath,
+        max_steps=max_steps,
+        min_step_px=min_step_px,
+        remaining_frame=remaining_frame,
+    ):
         yield x_seq, y_seq
 
 
@@ -116,14 +131,34 @@ def load_sensor_sequences(
     min_step_px: float = 0.0,
     remaining_frame: bool = True,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    xs, ys, _ = load_sensor_sequences_grouped(
+        filepath,
+        max_steps=max_steps,
+        min_step_px=min_step_px,
+        remaining_frame=remaining_frame,
+    )
+    return xs, ys
+
+
+def load_sensor_sequences_grouped(
+    filepath: str | Path,
+    max_steps: int | None = DEFAULT_MAX_STEPS,
+    min_step_px: float = 0.0,
+    remaining_frame: bool = True,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[str]]:
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
-    for x_seq, y_seq in iter_encoded_sensor_trajectories(
-        filepath, max_steps=max_steps, min_step_px=min_step_px, remaining_frame=remaining_frame
+    users: list[str] = []
+    for x_seq, y_seq, meta in iter_encoded_sensor_records(
+        filepath,
+        max_steps=max_steps,
+        min_step_px=min_step_px,
+        remaining_frame=remaining_frame,
     ):
         xs.append(np.asarray(x_seq, dtype=np.float32))
         ys.append(np.asarray(y_seq, dtype=np.float32))
-    return xs, ys
+        users.append(str(meta.get("user_id") or ""))
+    return xs, ys, users
 
 
 def load_sensor_jsonl(
@@ -133,27 +168,55 @@ def load_sensor_jsonl(
     min_step_px: float = 0.0,
     remaining_frame: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
+    X, Y, _ = load_sensor_jsonl_grouped(
+        filepath,
+        pad=pad,
+        max_steps=max_steps,
+        min_step_px=min_step_px,
+        remaining_frame=remaining_frame,
+    )
+    return X, Y
+
+
+def load_sensor_jsonl_grouped(
+    filepath: str | Path,
+    pad: float = -999999.0,
+    max_steps: int | None = DEFAULT_MAX_STEPS,
+    min_step_px: float = 0.0,
+    remaining_frame: bool = True,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     X_all: list[list[list[float]]] = []
     Y_all: list[list[list[float]]] = []
-    for x_seq, y_seq in iter_encoded_sensor_trajectories(
-        filepath, max_steps=max_steps, min_step_px=min_step_px, remaining_frame=remaining_frame
+    users: list[str] = []
+    for x_seq, y_seq, meta in iter_encoded_sensor_records(
+        filepath,
+        max_steps=max_steps,
+        min_step_px=min_step_px,
+        remaining_frame=remaining_frame,
     ):
         X_all.append(x_seq)
         Y_all.append(y_seq)
-    return _pad(X_all, pad), _pad(Y_all, pad)
+        users.append(str(meta.get("user_id") or ""))
+    return _pad(X_all, pad), _pad(Y_all, pad), users
 
 
-def collect_init_by_condition(filepath: str | Path) -> dict[str, dict[str, list[float]]]:
+def collect_init_by_condition(
+    filepath: str | Path,
+    allowed_users: set[str] | None = None,
+) -> dict[str, dict[str, list[float]]]:
     """Mean/std of the first IMU sample per swipe, grouped by condition."""
     buckets: dict[str, list[list[float]]] = {c: [] for c in CONDITIONS}
     for data in iter_jsonl(filepath):
+        meta = data.get("meta") or {}
+        if allowed_users is not None and str(meta.get("user_id") or "") not in allowed_users:
+            continue
         sensors = data.get("sensors") or []
         if not sensors:
             continue
         imu = _imu(sensors[0])
         if imu is None:
             continue
-        cond = (data.get("meta") or {}).get("condition")
+        cond = meta.get("condition")
         if cond in buckets:
             buckets[cond].append(imu)
     out: dict[str, dict[str, list[float]]] = {}

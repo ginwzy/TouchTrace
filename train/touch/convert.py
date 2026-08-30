@@ -27,6 +27,7 @@ def export_mdn_onnx(
     weights: Path | None = None,
     output: Path | None = None,
     extra_files: Sequence[Path] = (),
+    publish: bool = True,
 ) -> Path:
     import tensorflow as tf
     import tf2onnx
@@ -50,14 +51,15 @@ def export_mdn_onnx(
     spec = (tf.TensorSpec((1, None, config["input_dims"]), tf.float32, name="input"),)
     tf2onnx.convert.from_keras(export_model, input_signature=spec, output_path=str(out_path))
     print("Conversion complete.")
-    public = inference_public_onnx(out_path.name)
-    if public.parent.is_dir() and public.resolve() != out_path.resolve():
-        shutil.copy2(out_path, public)
-        print(f"Copied to {public}")
-        for src in extra_files:
-            if src.exists():
-                shutil.copy2(src, public.parent / src.name)
-                print(f"Copied {src.name} to {public.parent}")
+    if publish:
+        public = inference_public_onnx(out_path.name)
+        if public.parent.is_dir() and public.resolve() != out_path.resolve():
+            shutil.copy2(out_path, public)
+            print(f"Copied to {public}")
+            for src in extra_files:
+                if src.exists():
+                    shutil.copy2(src, public.parent / src.name)
+                    print(f"Copied {src.name} to {public.parent}")
     return out_path
 
 
